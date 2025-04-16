@@ -1,3 +1,45 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+.env/
+venv/
+.venv/
+ENV/
+
+# Jupyter Notebook
+.ipynb_checkpoints
+*.ipynb
+
+# Data and models
+data/*.csv
+data/*.json
+data/*.sqlite
+models/*.h5
+models/*.pth
+models/*.ckpt
+*.npz
+*.npy
+
 # Logs
 logs
 *.log
@@ -11,6 +53,8 @@ node_modules/
 
 # Environment variables
 .env
+.env.local
+.env.*.local
 
 # Editor directories and files
 .idea
@@ -23,7 +67,24 @@ node_modules/
 
 # OS specific
 .DS_Store
+Thumbs.db
+*.swp
+*.swo
 
 # Task files
 tasks.json
-tasks/ 
+tasks/
+
+# Testing
+.coverage
+htmlcov/
+.pytest_cache/
+.tox/
+.hypothesis/
+
+# Documentation
+docs/_build/
+site/
+
+# Streamlit
+.streamlit/ 
