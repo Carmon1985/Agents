@@ -18,8 +18,8 @@ A sophisticated monitoring system powered by AutoGen multi-agent architecture an
 
 - **Data Management**
   - SQLite database for efficient data storage
-  - Automated data ingestion module
-  - Structured schema for monitoring data
+  - Automated data ingestion module (`src/db/data_ingestion.py` and specific processors like `ChargedHoursIngestion`, `MasterFileIngestion`, `MLPIngestion`)
+  - Structured schema for monitoring data (`src/db/schema.sql`)
   - Tool functions for data manipulation
 
 ## 🚀 Getting Started
@@ -94,16 +94,35 @@ TEMPERATURE=0.7
 
 ## 🔧 Usage
 
-1. Start the Streamlit application:
+1. **Initialize Database:**
+   Run the initialization script if the database doesn't exist or needs resetting:
+   ```bash
+   python src/db/initialize_db.py
+   ```
+
+2. **Prepare Source Data:**
+   Place your source files (e.g., `charged_hours.csv`, `master_file.xlsx`, `mlp.xlsx`, `targets.csv`) in the `data/source/` directory (or configure paths in `src/db/data_ingestion.py`).
+
+3. **Run Data Ingestion (Example for one processor):**
+   You can run individual processors directly:
+   ```bash
+   python src/db/charged_hours_processor.py
+   python src/db/master_file_processor.py
+   python src/db/mlp_processor.py
+   # python src/db/targets_processor.py  (Once implemented)
+   ```
+   (A main ingestion script calling all processors will likely be added later).
+
+4. **Start the Streamlit application:**
    ```bash
    streamlit run src/ui/app.py
    ```
 
-2. Access the UI at `http://localhost:8501`
+5. Access the UI at `http://localhost:8501`
 
-3. Configure your monitoring parameters in the sidebar
+6. Configure your monitoring parameters in the sidebar
 
-4. View real-time monitoring data and alerts
+7. View real-time monitoring data and alerts
 
 ## 🧪 Testing
 
