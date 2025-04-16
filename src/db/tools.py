@@ -248,6 +248,10 @@ def calculate_utilization(start_date: str, end_date: str,
             - If employee_id is None, returns a DataFrame with 'employee_id' and 'utilization'.
             - Returns None if data is insufficient or an error occurs.
     """
+    # --- DEBUG PRINT --- 
+    print(f"--- DEBUG: calculate_utilization called with start={start_date}, end={end_date}, employee={employee_id} ---")
+    # --- END DEBUG PRINT ---
+    
     logging.info(f"Calculating utilization from {start_date} to {end_date} for employee: {employee_id or 'All'}")
 
     # 1. Get Charged Hours
