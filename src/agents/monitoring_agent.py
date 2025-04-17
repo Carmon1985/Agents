@@ -8,12 +8,13 @@ import os
 import autogen
 from dotenv import load_dotenv
 # Import the new database query function
-from src.db.query_functions import get_period_data
+from src.db.query_functions import get_period_data, forecast_next_month_utilization
 from autogen import AssistantAgent, UserProxyAgent
 from autogen.agentchat import GroupChat, GroupChatManager
 import pandas as pd
 import logging
 from typing import Optional # Import Optional for type hinting
+import json # Import json for structured output
 
 # Load environment variables
 load_dotenv()
@@ -81,50 +82,109 @@ analyze_utilization_tool = {
     },
 }
 
-
 # Define the function that performs the analysis using database data
 def analyze_utilization(start_date: str, end_date: str, employee_id: Optional[str] = None) -> str:
     """
-    Analyzes utilization by fetching data from the database for a given period
-    and optional employee, calculating the rate, and comparing it to the target.
+    Analyzes utilization, compares to target, classifies deviation, 
+    and returns a structured JSON string with analysis details and alert level.
     """
+    SIGNIFICANT_DEVIATION_THRESHOLD = 5.0
+    ALERT_THRESHOLD = SIGNIFICANT_DEVIATION_THRESHOLD # Alert if deviation exceeds this (absolute)
+    
+    result_data = {
+        "status": "ERROR",
+        "message": "Analysis did not complete.",
+        "details": {},
+        "alert_level": "NONE" # Levels: NONE, INFO, WARNING, CRITICAL
+    }
+    
     try:
         logger.info(f"Analyzing utilization for period {start_date} to {end_date}, Employee: {employee_id or 'All'}")
-
-        # Fetch data from the database
         charged_hours, capacity_hours, target_utilization_ratio = get_period_data(start_date, end_date, employee_id)
 
-        # Perform calculations and comparisons
+        result_data["details"]["period_start"] = start_date
+        result_data["details"]["period_end"] = end_date
+        result_data["details"]["employee_id"] = employee_id or "All"
+
         if capacity_hours <= 0:
-            logger.warning("Capacity hours are zero or negative. Cannot calculate utilization.")
-            return "Analysis Error: Capacity hours are zero or less, cannot calculate utilization."
+            logger.warning("Capacity hours are zero or negative.")
+            result_data["message"] = "Analysis Error: Capacity hours are zero or less, cannot calculate utilization."
+            result_data["alert_level"] = "WARNING" 
+            return json.dumps(result_data)
 
         utilization_rate = (charged_hours / capacity_hours) * 100
-        result_str = f"Analysis Period: {start_date} to {end_date}"
-        if employee_id:
-            result_str += f" | Employee: {employee_id}"
-        else:
-            result_str += " | Employee: All"
-        result_str += f"\nCharged Hours: {charged_hours:.2f}"
-        result_str += f"\nCapacity Hours: {capacity_hours:.2f}"
-        result_str += f"\nCalculated Utilization: {utilization_rate:.2f}%"
+        result_data["details"]["charged_hours"] = f"{charged_hours:.2f}"
+        result_data["details"]["capacity_hours"] = f"{capacity_hours:.2f}"
+        result_data["details"]["calculated_utilization_pct"] = f"{utilization_rate:.2f}"
+        result_data["status"] = "OK"
+        result_data["message"] = "Analysis successful."
+        result_data["alert_level"] = "INFO"
 
         if target_utilization_ratio is not None:
             target_percentage = target_utilization_ratio * 100
-            result_str += f"\nTarget Utilization: {target_percentage:.2f}%"
             deviation = utilization_rate - target_percentage
-            deviation_status = "Met/Exceeded" if deviation >= 0 else "Below Target"
-            result_str += f"\nDeviation from Target: {deviation:.2f}% ({deviation_status})"
+            result_data["details"]["target_utilization_pct"] = f"{target_percentage:.2f}"
+            result_data["details"]["deviation_pct"] = f"{deviation:.2f}"
+            
+            if deviation >= 0:
+                deviation_status = "Met/Exceeded Target"
+                result_data["alert_level"] = "INFO"
+            elif abs(deviation) <= ALERT_THRESHOLD: # Use ALERT_THRESHOLD here
+                deviation_status = "Slightly Below Target"
+                result_data["alert_level"] = "WARNING"
+            else:
+                deviation_status = "Significantly Below Target"
+                result_data["alert_level"] = "CRITICAL" # Set critical alert
+                
+            result_data["details"]["deviation_status"] = deviation_status
+            result_data["message"] = f"Analysis successful. Status: {deviation_status}"
         else:
-            result_str += "\nTarget Utilization: Not found"
+            result_data["details"]["target_utilization_pct"] = "Not found"
+            result_data["details"]["deviation_status"] = "Cannot assess deviation (no target)"
+            result_data["message"] = "Analysis successful, but no target found."
+            result_data["alert_level"] = "INFO" # No target isn't necessarily an alert
 
-        logger.info(f"Analysis complete. Result: {result_str}")
-        return result_str
+        logger.info(f"Analysis complete. Alert Level: {result_data['alert_level']}")
+        return json.dumps(result_data, indent=2)
 
     except Exception as e:
         logger.error(f"An unexpected error occurred during utilization analysis: {e}", exc_info=True)
-        return f"An unexpected error occurred during analysis: {e}"
+        result_data["message"] = f"Unexpected Error: {e}"
+        result_data["alert_level"] = "ERROR"
+        return json.dumps(result_data)
 
+# --- Tool 2: Forecast Utilization (New) ---
+forecast_utilization_tool = {
+    "type": "function",
+    "function": {
+        "name": "forecast_next_month_utilization",
+        "description": "Forecasts the next calendar month's resource utilization based on the average of a specified number of past months (forecast_window). Requires specifying how many total months of history (num_history_months) to fetch to calculate the average.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "num_history_months": {
+                    "type": "integer",
+                    "description": "The total number of past months of historical data to retrieve.",
+                },
+                "current_date_str": {
+                    "type": "string",
+                    "description": "The current date (YYYY-MM-DD) used as the reference point for fetching history (history ends before this date's month).",
+                },
+                 "employee_id": {
+                    "type": "string",
+                    "description": "Optional. The specific employee ID to forecast for. If omitted, forecasts aggregate utilization.",
+                },
+                "forecast_window": {
+                    "type": "integer",
+                    "description": "Optional. The number of recent historical months (default 3) to average for the forecast.",
+                    "default": 3
+                },
+            },
+            "required": ["num_history_months", "current_date_str"],
+        },
+    },
+}
+# Note: The actual implementation `forecast_next_month_utilization` is imported from query_functions
 
 # ------------------ Agent Setup ------------------
 
@@ -146,7 +206,7 @@ agent_llm_config = {
     "temperature": 0,
     "timeout": 600,
     "cache_seed": None, # Use None for non-deterministic calls
-    "tools": [analyze_utilization_tool], # Provide the tool schema here
+    "tools": [analyze_utilization_tool, forecast_utilization_tool], # Add new tool schema
 }
 
 # LLM config for the manager (does not need the tool definition itself)
@@ -161,19 +221,28 @@ manager_llm_config = {
 # Create MonitoringAgent instance
 monitoring_agent = autogen.AssistantAgent(
     name="Monitoring_Agent",
-    system_message="""You are a monitoring agent specializing in resource utilization analysis.
-Your task is to analyze utilization based on provided date ranges (start_date, end_date) and an optional employee_id.
-You must use the `analyze_utilization` tool to perform the analysis, which involves querying a database, calculating the utilization rate (charged hours / capacity hours), and comparing it to the target utilization.
-Extract the required parameters (start_date, end_date, employee_id [optional]) from the user request.
-Call the `analyze_utilization` tool with these parameters.
-Report the full analysis result provided by the tool, including charged hours, capacity hours, calculated utilization, target utilization (if found), and deviation.
-If the tool returns an error, report the error message.
-Do not perform calculations yourself or make assumptions; rely solely on the tool's output.
-After reporting the result or error, conclude the conversation by replying with the word TERMINATE.""",
-    llm_config=agent_llm_config, # <<< Use the config WITH tools for this agent >>>
+    system_message="""You are a monitoring agent specializing in resource utilization analysis and forecasting.
+
+Your tasks are:
+1.  **Analyze Current Utilization:** Use the `analyze_utilization` tool. It returns a JSON string containing analysis details and an `alert_level` (NONE, INFO, WARNING, CRITICAL, ERROR).
+2.  **Forecast Future Utilization:** Use the `forecast_next_month_utilization` tool. It returns a string describing the forecast or an error.
+
+**Your Response Rules:**
+*   When using `analyze_utilization`:
+    *   Parse the JSON result provided by the tool.
+    *   If the `alert_level` is `WARNING` or `CRITICAL`, format your response as an **ALERT** message, clearly stating the reason (e.g., 'Significantly Below Target', 'Zero Capacity') and including key details like Period, Employee (if applicable), Calculated Utilization, Target Utilization, and Deviation.
+    *   If the `alert_level` is `INFO`, `NONE`, or `ERROR`, simply report the main message or status from the JSON result.
+*   When using `forecast_next_month_utilization`:
+    *   Report the exact string result provided by the tool.
+*   Extract required parameters from the user request for the appropriate tool.
+*   Call the correct tool based on the user's request (analysis vs. forecast).
+*   If a tool itself fails or the JSON parsing fails, report the error encountered.
+*   Do not perform calculations or forecasts yourself; rely solely on the tools' outputs.
+*   After reporting the result/alert or error, conclude the conversation by replying with the word TERMINATE.""",
+    llm_config=agent_llm_config, # Use the config WITH tools
 )
 
-# Create UserProxyAgent instance (to execute the function)
+# Create UserProxyAgent instance (Updated Function Map)
 user_proxy = autogen.UserProxyAgent(
    name="User_Proxy",
    human_input_mode="NEVER", # Agent executes functions without asking
@@ -181,10 +250,10 @@ user_proxy = autogen.UserProxyAgent(
    # Check if the message content indicates termination
    is_termination_msg=lambda x: isinstance(x, dict) and "TERMINATE" in x.get("content", "").upper(),
    code_execution_config=False, # No code execution needed here
-   # Register the *actual Python function* with the User Proxy agent
-   # The key MUST match the function name defined in the tool schema
+   # Register BOTH functions with the User Proxy agent
    function_map={
-       "analyze_utilization": analyze_utilization
+       "analyze_utilization": analyze_utilization, # Existing function
+       "forecast_next_month_utilization": forecast_next_month_utilization # New function
    }
 )
 
@@ -205,9 +274,9 @@ manager = autogen.GroupChatManager(
 # ------------------ Main Execution ------------------
 
 if __name__ == "__main__":
-    # Example initial prompt asking for analysis within a date range
-    initial_prompt = "Analyze the resource utilization between 2024-01-01 and 2024-01-31 for employee EMP001."
-    # Alt prompt (all employees): "Analyze the resource utilization between 2024-02-01 and 2024-02-29."
+    # Use a prompt that should trigger analysis, e.g., April 2025 
+    # (assuming data exists, otherwise it will show the capacity error)
+    initial_prompt = "Analyze the resource utilization between 2025-04-01 and 2025-04-30."
 
     logger.info(f"Initiating chat with prompt: '{initial_prompt}'")
 
