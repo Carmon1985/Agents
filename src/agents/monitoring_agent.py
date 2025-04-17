@@ -1,123 +1,228 @@
-import autogen
-import logging
 import sys
-import os
-import datetime
-from dotenv import load_dotenv
+import pathlib
+# Assuming the script is in src/agents, go up two levels to get the project root
+project_root = pathlib.Path(__file__).resolve().parent.parent.parent
+sys.path.insert(0, str(project_root))
 
-# --- Load Environment Variables ---
-# Load variables from .env file into environment
+import os
+import autogen
+from dotenv import load_dotenv
+# Import the new database query function
+from src.db.query_functions import get_period_data
+from autogen import AssistantAgent, UserProxyAgent
+from autogen.agentchat import GroupChat, GroupChatManager
+import pandas as pd
+import logging
+from typing import Optional # Import Optional for type hinting
+
+# Load environment variables
 load_dotenv()
 
-# --- Path Setup ---
-# Add project root to the Python path
-# This allows us to import modules like src.db.tools
-project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
-if project_root not in sys.path:
-    sys.path.insert(0, project_root)
+# --- Azure OpenAI Configuration ---
+azure_endpoint = os.getenv("OPENAI_API_BASE")
+azure_deployment_name = os.getenv("OPENAI_DEPLOYMENT_NAME")
+azure_api_version = os.getenv("OPENAI_API_VERSION")
+azure_api_key = os.getenv("OPENAI_API_KEY")
+azure_api_type = os.getenv("OPENAI_API_TYPE", "azure") # Default to azure if not specified
 
-try:
-    from src.db import tools as db_tools
-except ImportError as e:
-    logging.error(f"Error importing db_tools: {e}. Ensure the project structure is correct and dependencies are installed.")
-    # Handle the error appropriately, maybe exit or raise
-    raise
+# Basic validation
+missing_vars = []
+if not azure_endpoint: missing_vars.append("OPENAI_API_BASE")
+if not azure_deployment_name: missing_vars.append("OPENAI_DEPLOYMENT_NAME")
+if not azure_api_version: missing_vars.append("OPENAI_API_VERSION")
+if not azure_api_key: missing_vars.append("OPENAI_API_KEY")
+
+if missing_vars:
+    raise ValueError(f"Missing required Azure OpenAI environment variables: {', '.join(missing_vars)}")
 
 # --- Logging Setup ---
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    handlers=[
+        logging.StreamHandler(sys.stdout) # Ensure logs go to stdout
+    ]
+)
 logger = logging.getLogger(__name__)
+logger.info("Azure OpenAI Configuration Loaded:")
+logger.info(f"  Endpoint: {azure_endpoint}")
+logger.info(f"  Deployment Name: {azure_deployment_name}")
+logger.info(f"  API Version: {azure_api_version}")
+logger.info(f"  API Type: {azure_api_type}")
+logger.info(f"  API Key: {'********' + azure_api_key[-4:] if azure_api_key else 'Not Set'}")
 
-# --- Agent Configuration ---
 
-MONITORING_AGENT_SYSTEM_PROMPT = """You are the Performance Monitoring Agent.
-Your primary responsibilities are:
-1.  **Query Data:** Use the provided database tool functions (`get_performance_data`, `get_targets`, `get_employee_data`, `get_project_data`, `calculate_utilization`) to retrieve relevant performance metrics, targets, and contextual data based on user requests or scheduled checks.
-2.  **Analyze & Compare:** Analyze the retrieved data. Compare current performance against targets and historical data (e.g., previous month, same period last year). Calculate key metrics like utilization and month-over-month changes.
-3.  **Identify Deviations:** Identify significant deviations from targets or historical norms based on predefined or adaptable thresholds. Correlate segment performance issues with potentially impacted projects or employees using available data.
-4.  **Forecast Trends:** Perform simple trend analysis or forecasting based on historical performance data.
-5.  **Generate Alerts:** Generate clear, structured alerts summarizing significant findings, deviations, potential risks, or trends. Include relevant context and data points in your alerts.
-6.  **Leverage History:** You MUST actively use the conversation history and your memory of past analyses to provide context, track trends over time, and avoid redundant calculations or questions. Refer to previous results when relevant (e.g., "Last month's utilization was X, this month it is Y"). Ask clarifying questions if the request is ambiguous or lacks necessary parameters (like date ranges).
+# ------------------ Tool Definition & Function ------------------
 
-You have access to the following database tool functions:
-- `get_performance_data(start_date: str, end_date: str, employee_id: str | None = None, project_id: str | None = None)`
-- `get_targets(year: int | None = None, month: int | None = None, employee_id: str | None = None)`
-- `get_employee_data(employee_id: str | None = None, segment: str | None = None)`
-- `get_project_data(project_id: str | None = None, manager_id: str | None = None)`
-- `calculate_utilization(start_date: str, end_date: str, employee_id: str | None = None)`
-
-Execute queries precisely as requested. When performing comparisons or analyses, clearly state the period you are analyzing. Always check if you have sufficient historical context from the conversation before asking for it or re-querying extensively. Structure your findings logically.
-"""
-
-# TODO: Load LLM Config from a central place (e.g., OAI_CONFIG_LIST)
-# For now, using a placeholder. Replace with your actual config loading.
-# config_list = autogen.config_list_from_json(
-#     "OAI_CONFIG_LIST",
-#     filter_dict={
-#         "model": ["gpt-4", "gpt-3.5-turbo"], # Example models
-#     },
-# )
-
-# Placeholder config - replace with actual OpenAI or other LLM config
-llm_config = {
-    "config_list": [{"model": "gpt-4", "api_key": os.environ.get("OPENAI_API_KEY")}],
-    "temperature": 0.7,
-    # Add other relevant LLM parameters like timeout, cache_seed, etc.
+# Define the tool schema for the LLM
+analyze_utilization_tool = {
+    "type": "function",
+    "function": {
+        "name": "analyze_utilization",
+        "description": "Analyzes resource utilization for a given date range and optional employee ID by querying charged hours, capacity hours, and target utilization from the database.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "start_date": {
+                    "type": "string",
+                    "description": "The start date for the analysis period in YYYY-MM-DD format.",
+                },
+                "end_date": {
+                    "type": "string",
+                    "description": "The end date for the analysis period in YYYY-MM-DD format.",
+                },
+                "employee_id": {
+                    "type": "string",
+                    "description": "Optional. The specific employee ID to analyze. If omitted, analyzes aggregate utilization.",
+                },
+            },
+            "required": ["start_date", "end_date"],
+        },
+    },
 }
 
 
-# --- Agent Definition ---
+# Define the function that performs the analysis using database data
+def analyze_utilization(start_date: str, end_date: str, employee_id: Optional[str] = None) -> str:
+    """
+    Analyzes utilization by fetching data from the database for a given period
+    and optional employee, calculating the rate, and comparing it to the target.
+    """
+    try:
+        logger.info(f"Analyzing utilization for period {start_date} to {end_date}, Employee: {employee_id or 'All'}")
+
+        # Fetch data from the database
+        charged_hours, capacity_hours, target_utilization_ratio = get_period_data(start_date, end_date, employee_id)
+
+        # Perform calculations and comparisons
+        if capacity_hours <= 0:
+            logger.warning("Capacity hours are zero or negative. Cannot calculate utilization.")
+            return "Analysis Error: Capacity hours are zero or less, cannot calculate utilization."
+
+        utilization_rate = (charged_hours / capacity_hours) * 100
+        result_str = f"Analysis Period: {start_date} to {end_date}"
+        if employee_id:
+            result_str += f" | Employee: {employee_id}"
+        else:
+            result_str += " | Employee: All"
+        result_str += f"\nCharged Hours: {charged_hours:.2f}"
+        result_str += f"\nCapacity Hours: {capacity_hours:.2f}"
+        result_str += f"\nCalculated Utilization: {utilization_rate:.2f}%"
+
+        if target_utilization_ratio is not None:
+            target_percentage = target_utilization_ratio * 100
+            result_str += f"\nTarget Utilization: {target_percentage:.2f}%"
+            deviation = utilization_rate - target_percentage
+            deviation_status = "Met/Exceeded" if deviation >= 0 else "Below Target"
+            result_str += f"\nDeviation from Target: {deviation:.2f}% ({deviation_status})"
+        else:
+            result_str += "\nTarget Utilization: Not found"
+
+        logger.info(f"Analysis complete. Result: {result_str}")
+        return result_str
+
+    except Exception as e:
+        logger.error(f"An unexpected error occurred during utilization analysis: {e}", exc_info=True)
+        return f"An unexpected error occurred during analysis: {e}"
+
+
+# ------------------ Agent Setup ------------------
+
+# Configure LLM settings for agents and manager
+# Note: Define tool for the agent that needs to call it.
+config_list = [
+    {
+        "model": azure_deployment_name,
+        "api_key": azure_api_key,
+        "base_url": azure_endpoint,
+        "api_type": azure_api_type,
+        "api_version": azure_api_version,
+    }
+]
+
+# LLM config for the agent that will use the tool
+agent_llm_config = {
+    "config_list": config_list,
+    "temperature": 0,
+    "timeout": 600,
+    "cache_seed": None, # Use None for non-deterministic calls
+    "tools": [analyze_utilization_tool], # Provide the tool schema here
+}
+
+# LLM config for the manager (does not need the tool definition itself)
+manager_llm_config = {
+    "config_list": config_list,
+    "temperature": 0,
+    "timeout": 600,
+    "cache_seed": None,
+}
+
+
+# Create MonitoringAgent instance
 monitoring_agent = autogen.AssistantAgent(
     name="Monitoring_Agent",
-    system_message=MONITORING_AGENT_SYSTEM_PROMPT,
-    llm_config=llm_config,
-    # Ensure agent can execute function calls
-    # function_map is deprecated, use register_function instead
+    system_message="""You are a monitoring agent specializing in resource utilization analysis.
+Your task is to analyze utilization based on provided date ranges (start_date, end_date) and an optional employee_id.
+You must use the `analyze_utilization` tool to perform the analysis, which involves querying a database, calculating the utilization rate (charged hours / capacity hours), and comparing it to the target utilization.
+Extract the required parameters (start_date, end_date, employee_id [optional]) from the user request.
+Call the `analyze_utilization` tool with these parameters.
+Report the full analysis result provided by the tool, including charged hours, capacity hours, calculated utilization, target utilization (if found), and deviation.
+If the tool returns an error, report the error message.
+Do not perform calculations yourself or make assumptions; rely solely on the tool's output.
+After reporting the result or error, conclude the conversation by replying with the word TERMINATE.""",
+    llm_config=agent_llm_config, # <<< Use the config WITH tools for this agent >>>
 )
 
-# --- Register Database Tools ---
-# Make the db tool functions available to the agent
-monitoring_agent.register_function(
-    function_map={
-        "get_performance_data": db_tools.get_performance_data,
-        "get_targets": db_tools.get_targets,
-        "get_employee_data": db_tools.get_employee_data,
-        "get_project_data": db_tools.get_project_data,
-        "calculate_utilization": db_tools.calculate_utilization,
-    }
+# Create UserProxyAgent instance (to execute the function)
+user_proxy = autogen.UserProxyAgent(
+   name="User_Proxy",
+   human_input_mode="NEVER", # Agent executes functions without asking
+   max_consecutive_auto_reply=10, # Limit consecutive replies
+   # Check if the message content indicates termination
+   is_termination_msg=lambda x: isinstance(x, dict) and "TERMINATE" in x.get("content", "").upper(),
+   code_execution_config=False, # No code execution needed here
+   # Register the *actual Python function* with the User Proxy agent
+   # The key MUST match the function name defined in the tool schema
+   function_map={
+       "analyze_utilization": analyze_utilization
+   }
 )
 
-# --- Agent Usage and Interaction Setup ---
+
+# ------------------ Group Chat Setup ------------------
+groupchat = autogen.GroupChat(
+    agents=[user_proxy, monitoring_agent],
+    messages=[],
+    max_round=12, # Maximum rounds of conversation
+    speaker_selection_method="auto" # Auto-selects the next speaker
+)
+
+manager = autogen.GroupChatManager(
+    groupchat=groupchat,
+    llm_config=manager_llm_config, # Manager uses config without specific tools defined
+)
+
+# ------------------ Main Execution ------------------
+
 if __name__ == "__main__":
-    logger.info("Setting up agent interaction...")
+    # Example initial prompt asking for analysis within a date range
+    initial_prompt = "Analyze the resource utilization between 2024-01-01 and 2024-01-31 for employee EMP001."
+    # Alt prompt (all employees): "Analyze the resource utilization between 2024-02-01 and 2024-02-29."
 
-    # Create a UserProxyAgent to interact with the MonitoringAgent
-    # This agent can execute function calls made by the assistant
-    user_proxy = autogen.UserProxyAgent(
-        name="User_Proxy",
-        human_input_mode="NEVER", # Don't require human input during this automated test
-        max_consecutive_auto_reply=10,
-        is_termination_msg=lambda x: x.get("content", "").rstrip().endswith("TERMINATE"),
-        # The UserProxyAgent needs to be able to execute the functions
-        # called by the MonitoringAgent. We register them here too.
-        function_map={
-            "get_performance_data": db_tools.get_performance_data,
-            "get_targets": db_tools.get_targets,
-            "get_employee_data": db_tools.get_employee_data,
-            "get_project_data": db_tools.get_project_data,
-            "calculate_utilization": db_tools.calculate_utilization,
-        },
-        # Alternatively, configure code execution if functions require it
-        # code_execution_config={"work_dir": "_agent_output"}, 
-        llm_config=llm_config # Can optionally have its own LLM config
-    )
+    logger.info(f"Initiating chat with prompt: '{initial_prompt}'")
 
-    logger.info("Initiating chat...")
-    # Example Chat: Ask the monitoring agent to perform a calculation
-    initial_message = "Calculate utilization for employee 'emp1' between 2024-01-01 and 2024-01-31."
+    try:
+        # Initiate the chat using the User Proxy Agent, triggering the group chat flow
+        user_proxy.initiate_chat(
+            manager,
+            message=initial_prompt
+        )
+        logger.info("Chat finished successfully.")
 
-    user_proxy.initiate_chat(
-        monitoring_agent,
-        message=initial_message
-    )
+    except autogen.oai.APIError as api_err:
+        logger.error(f"Azure OpenAI API Error: {api_err}")
+        logger.error(f"Check your Azure credentials, endpoint, deployment name, and API version in the .env file.")
+    except Exception as e:
+        logger.error(f"An unexpected error occurred during chat execution: {e}", exc_info=True)
 
-    logger.info("Chat finished.") 
+    logger.info("Script finished.")

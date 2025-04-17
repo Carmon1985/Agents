@@ -1,6 +1,127 @@
-# Multi-Agent Monitoring System
+# Project: Agents - Resource Monitoring
 
-A sophisticated monitoring system powered by AutoGen multi-agent architecture and Streamlit UI. The system uses multiple AI agents to monitor, analyze, and provide recommendations based on data inputs.
+This project implements a multi-agent system using AutoGen to monitor resource utilization based on data ingested from external sources.
+
+## Features
+
+*   **Data Ingestion:** Processes data from Excel files (Charged Hours, Master File, Targets) and loads it into a SQLite database.
+*   **Database Schema:** Uses SQLite (`data/database.db`) with tables for `charged_hours`, `master_file`, and `targets`.
+*   **Monitoring Agent:** An AutoGen agent that can query the database, calculate utilization for specific periods/employees, and compare against targets.
+*   **Azure OpenAI Integration:** Uses Azure OpenAI for the LLM powering the agents.
+
+## Project Structure
+
+```
+Agents/
+├── data/
+│   ├── database.db           # SQLite database (created by schema_setup)
+│   ├── dummy_charged_hours.xlsx # Example source data
+│   ├── dummy_master_file.xlsx   # Example source data
+│   └── dummy_targets.xlsx       # Example source data
+├── src/
+│   ├── __init__.py
+│   ├── agents/
+│   │   ├── __init__.py
+│   │   └── monitoring_agent.py # Main script for the monitoring agent
+│   ├── db/
+│   │   ├── __init__.py
+│   │   ├── base_processor.py     # Base class for data processors
+│   │   ├── charged_hours_processor.py
+│   │   ├── master_file_processor.py
+│   │   ├── targets_processor.py
+│   │   ├── schema_setup.py       # Script to create DB tables
+│   │   ├── query_functions.py    # Functions used by agent to query DB
+│   │   └── ingest_data.py        # Main script to run data ingestion
+│   └── ui/                 # (Placeholder for potential UI components)
+│       └── __init__.py
+├── tests/                # Unit and integration tests
+│   ├── __init__.py
+│   ├── integration/
+│   │   └── __init__.py
+│   └── unit/
+│       └── __init__.py
+├── .env                  # Environment variables (Azure OpenAI keys, etc.)
+├── .gitignore
+├── README.md             # This file
+├── requirements.txt      # Python dependencies (ensure this is created/updated)
+├── tasks/                # Task management files (if using task-master)
+│   └── tasks.json
+└── ... (other config files)
+```
+
+## Setup
+
+1.  **Clone the repository:**
+    ```bash
+    git clone <repository_url>
+    cd Agents
+    ```
+
+2.  **Create and activate a virtual environment:** (Recommended)
+    ```bash
+    python -m venv venv
+    # Windows
+    .\venv\Scripts\activate
+    # macOS/Linux
+    source venv/bin/activate
+    ```
+
+3.  **Install dependencies:**
+    *Make sure `requirements.txt` exists and is up-to-date.*
+    ```bash
+    pip install -r requirements.txt
+    ```
+
+4.  **Configure Environment Variables:**
+    *   Create a `.env` file in the project root.
+    *   Add your Azure OpenAI credentials:
+        ```dotenv
+        OPENAI_API_KEY="your_azure_openai_api_key"
+        OPENAI_API_BASE="https://your_azure_resource_name.openai.azure.com/" # Your Azure Endpoint URL
+        OPENAI_API_VERSION="your_api_version" # e.g., 2024-02-15-preview
+        OPENAI_API_TYPE="azure"
+        OPENAI_DEPLOYMENT_NAME="your_deployment_name" # The name you gave the model deployment in Azure
+        ```
+
+## Data Setup
+
+1.  **Create Database Schema:**
+    Run the setup script from the project root directory:
+    ```bash
+    python src/db/schema_setup.py
+    ```
+    This will create the `data/database.db` file and the necessary tables.
+
+2.  **Prepare Source Files:**
+    *   Place your source data Excel files in the `data/` directory.
+    *   Ensure the filenames match those expected by `src/db/ingest_data.py` (e.g., `dummy_charged_hours.xlsx`, `dummy_master_file.xlsx`, `dummy_targets.xlsx`).
+    *   **Crucially**, ensure the column headers within each Excel file match the expected names:
+        *   `dummy_charged_hours.xlsx`: `Employee Identifier`, `Date Worked`, `Hours Charged`, `Project Code`, `Task Description`
+        *   `dummy_master_file.xlsx`: `Employee Identifier`, `Date`, `Capacity Hours`, `Employee Name`, `Department`
+        *   `dummy_targets.xlsx`: `Employee Identifier`, `Target Date`, `Target Utilization Pct`, `Notes`
+
+3.  **Run Data Ingestion:**
+    Run the ingestion script *as a module* from the project root directory:
+    ```bash
+    python -m src.db.ingest_data
+    ```
+    This will read the data from the Excel files, transform it, and load it into the `data/database.db` SQLite database.
+
+## Running the Monitoring Agent
+
+Once the database is populated, you can run the monitoring agent script *as a module* from the project root:
+
+```bash
+python -m src.agents.monitoring_agent
+```
+
+The script will initiate a chat, and the agent will use the `analyze_utilization` tool (which queries the database) based on the `initial_prompt` defined within the script.
+
+## Development Notes
+
+*   The system uses `task-master` for task management (see `tasks/tasks.json`).
+*   Processors inherit from `src/db/base_processor.py`.
+*   Logging is configured in various modules; check console output for details.
 
 ## 🌟 Features
 

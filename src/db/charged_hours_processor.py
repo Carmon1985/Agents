@@ -2,144 +2,159 @@ import pandas as pd
 import logging
 import os
 import sqlite3
+import sys
+from src.db.schema_setup import get_db_connection # Import the shared connection function
+from .base_processor import BaseDataProcessor # Assuming a base class exists
 
 # Assuming data_ingestion.py is in the same directory or Python path is configured
-from .data_ingestion import DataIngestion, DEFAULT_FILE_PATHS, DEFAULT_DB_PATH
+try:
+    # This works when run as module: python -m src.db.charged_hours_processor ...
+    from .data_ingestion import DataIngestion, DEFAULT_DB_PATH
+except ImportError:
+    # This works when run as script: python src/db/charged_hours_processor.py ...
+    # Requires src/ to be in PYTHONPATH or run from root with src/ prepended
+    from data_ingestion import DataIngestion, DEFAULT_DB_PATH
 
-class ChargedHoursIngestion(DataIngestion):
-    """
-    Concrete implementation for ingesting Charged Hours data.
-    Reads from a CSV file, transforms the data, and loads it into the
-    'charged_hours' table in the SQLite database.
-    """
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(name)s - %(message)s')
+logger = logging.getLogger(__name__)
 
+class ChargedHoursIngestion(BaseDataProcessor):
+    """Handles ingestion of Charged Hours data from XLSX to SQLite."""
+
+    # Define source columns expected in the Excel file
     EXPECTED_COLUMNS = [
-        'Employee Identifier', 
-        'Project Identifier', 
-        'Date Worked', 
-        'Charged Hours'
-        # 'Employee Name' and 'Project Name' are ignored as per PRD schema need
+        'Employee Identifier', # Changed from 'Employee ID'
+        'Date Worked',         # Changed from 'Date'
+        'Hours Charged',       # Changed from 'Charged Hours'
+        'Project Code',
+        'Task Description'
     ]
-    
+    # Define columns critical for validation
+    CRITICAL_SOURCE_COLUMNS = [
+        'Employee Identifier',
+        'Date Worked',
+        'Hours Charged'
+    ]
+    # Map source columns to database columns
+    COLUMN_MAPPING = {
+        'Employee Identifier': 'employee_id',
+        'Date Worked': 'date',
+        'Hours Charged': 'charged_hours',
+        'Project Code': 'project_code',
+        'Task Description': 'task_description'
+    }
+    # Define the target database table
     TARGET_TABLE = 'charged_hours'
 
-    def read_source(self) -> pd.DataFrame:
-        """Reads the Charged Hours XLSX file (first sheet) into a pandas DataFrame."""
-        try:
-            df = pd.read_excel(self.source_file_path, sheet_name=0)
-            self.logger.info(f"Read {len(df)} rows from {self.source_file_path}")
-            missing_cols = [col for col in self.EXPECTED_COLUMNS if col not in df.columns]
-            if missing_cols:
-                self.logger.error(f"Missing expected columns in source file: {missing_cols}")
-                raise ValueError(f"Source file {self.source_file_path} is missing required columns: {missing_cols}")
-            return df
-        except FileNotFoundError:
-            self.logger.error(f"Source file not found: {self.source_file_path}")
-            raise 
-        except Exception as e:
-            self.logger.error(f"Error reading Excel file {self.source_file_path}: {e}")
-            raise 
-
     def transform_data(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Transforms the raw Charged Hours data."""
-        self.logger.debug("Starting data transformation...")
-        
-        # Select only expected columns first to avoid issues with extra cols
-        df_transformed = df[self.EXPECTED_COLUMNS].copy()
+        """Transforms the raw DataFrame: parses dates, converts types, renames columns."""
+        if df is None:
+            self.logger.warning("Input DataFrame for transformation is None.")
+            return None
 
-        # --- Data Type Conversion (BEFORE renaming) --- 
-        # Explicitly infer datetime format
-        df_transformed['Date Worked'] = pd.to_datetime(df_transformed['Date Worked'], infer_datetime_format=True, errors='coerce')
-        # Convert Charged Hours
-        df_transformed['Charged Hours'] = pd.to_numeric(df_transformed['Charged Hours'], errors='coerce')
-        self.logger.debug("Converted source data types for date (inferring format) and hours.")
+        self.logger.info(f"Starting transformation for {self.__class__.__name__}...")
 
-        # --- Rename Columns --- 
-        df_transformed.rename(columns={
-            'Employee Identifier': 'employee_id',
-            'Project Identifier': 'project_id',
-            'Date Worked': 'charge_date',
-            'Charged Hours': 'charged_hours'
-        }, inplace=True)
-        self.logger.debug("Renamed columns.")
+        # Ensure critical columns are present before proceeding
+        missing_critical = [col for col in self.CRITICAL_SOURCE_COLUMNS if col not in df.columns]
+        if missing_critical:
+            self.logger.error(f"Critical columns missing for transformation: {missing_critical}")
+            # Optionally, raise an error or return None depending on desired behavior
+            # raise ValueError(f"Critical columns missing: {missing_critical}")
+            return None
 
-        # --- Clean IDs (Convert to string, strip, replace specific non-values with None) ---
-        for col in ['employee_id', 'project_id']:
-            if col in df_transformed.columns:
-                df_transformed[col] = df_transformed[col].fillna('__NA__').astype(str).str.strip()
-                df_transformed[col] = df_transformed[col].replace(
-                    {'': None, 'None': None, 'nan': None, 'NaT': None, '<NA>': None, '__NA__': None}
-                )
-        self.logger.debug("Cleaned and standardized ID columns.")
-
-        # --- Handle missing/invalid values --- 
-        initial_rows = len(df_transformed)
-        critical_cols = ['employee_id', 'project_id', 'charge_date', 'charged_hours']
-        
-        # Log check BEFORE dropna
-        null_check_before = df_transformed[critical_cols].isnull().sum()
-        self.logger.debug(f"Null check BEFORE dropna:\n{null_check_before}")
-        rows_to_be_dropped = df_transformed[df_transformed[critical_cols].isnull().any(axis=1)]
-        if not rows_to_be_dropped.empty:
-             self.logger.debug(f"Rows potentially being dropped by dropna:\n{rows_to_be_dropped}")
-
-        # Drop rows where ANY critical column is None/NaT/NaN
-        df_transformed.dropna(subset=critical_cols, inplace=True)
-        
-        final_rows = len(df_transformed)
-        if initial_rows != final_rows:
-            self.logger.warning(f"Dropped {initial_rows - final_rows} rows due to missing/invalid critical values.")
-        
-        # Log check AFTER dropna
-        null_check_after = df_transformed[critical_cols].isnull().sum()
-        self.logger.debug(f"Null check AFTER dropna:\n{null_check_after}")
-
-        # --- Final Formatting --- 
-        if not df_transformed.empty:
-            # Ensure date column exists and format it
-            if 'charge_date' in df_transformed.columns:
-                 # It should be datetime already if not NaT, format directly
-                 df_transformed['charge_date'] = df_transformed['charge_date'].dt.strftime('%Y-%m-%d')
-                 self.logger.debug("Formatted charge_date as YYYY-MM-DD string.")
-
-        self.logger.info("Data transformation completed.")
-        return df_transformed
-
-    def load_to_db(self, df: pd.DataFrame):
-        """Loads the transformed Charged Hours data into the SQLite database."""
-        if df.empty:
-            self.logger.warning("Transformed DataFrame is empty. No data to load.")
-            return
-            
-        self.logger.info(f"Loading {len(df)} rows into table '{self.TARGET_TABLE}' using 'replace' strategy.")
-        
+        # 1. Handle Dates ('Date Worked')
+        date_col = 'Date Worked' # Use the correct source column name
         try:
-            df.to_sql(self.TARGET_TABLE, 
-                      self.conn, 
-                      if_exists='replace', 
-                      index=False,
-                     )
-            self.logger.info(f"Successfully loaded data into '{self.TARGET_TABLE}'.")
-        except sqlite3.IntegrityError as e:
-            self.logger.error(f"Database integrity error during load: {e}. Check foreign key references (employee_id, project_id). Ensure referenced employees/projects exist.")
-            raise # Re-raise to be caught by the main process method for rollback
+            # Convert to datetime objects, coercing errors to NaT (Not a Time)
+            df[date_col] = pd.to_datetime(df[date_col], errors='coerce', infer_datetime_format=True)
+            # Drop rows where date conversion failed
+            original_count = len(df)
+            df.dropna(subset=[date_col], inplace=True)
+            if len(df) < original_count:
+                 self.logger.warning(f"Dropped {original_count - len(df)} rows due to invalid date formats in '{date_col}'.")
+            # Format dates as YYYY-MM-DD strings for SQLite compatibility
+            df[date_col] = df[date_col].dt.strftime('%Y-%m-%d')
+            self.logger.debug(f"Successfully parsed and formatted '{date_col}'.")
+        except KeyError:
+             self.logger.error(f"Date column '{date_col}' not found in DataFrame.")
+             return None
         except Exception as e:
-            self.logger.error(f"Error loading data into table '{self.TARGET_TABLE}': {e}")
-            raise # Re-raise
+            self.logger.error(f"Error processing date column '{date_col}': {e}", exc_info=True)
+            return None
 
-# Allow running this processor directly for testing or manual execution
-if __name__ == '__main__':
-    logging.info("Running Charged Hours Ingestion Processor directly...")
-    
-    # Use default paths defined in the base class config
-    source_path = DEFAULT_FILE_PATHS.get('charged_hours')
-    db_path = DEFAULT_DB_PATH
-    
-    if not source_path:
-        logging.error("Default path for 'charged_hours' not found in configuration.")
-    elif not os.path.exists(source_path) or not source_path.endswith('.xlsx'):
-         logging.error(f"Source Excel file not found at default path: {source_path}. Ensure it ends with .xlsx")
-    else:
-        processor = ChargedHoursIngestion(source_file_path=source_path, db_path=db_path)
-        processor.process() 
-        logging.info("Charged Hours Ingestion Processor finished.") 
+        # 2. Handle Numeric Types ('Hours Charged')
+        numeric_col = 'Hours Charged' # Use the correct source column name
+        if numeric_col in df.columns:
+            try:
+                df[numeric_col] = pd.to_numeric(df[numeric_col], errors='coerce')
+                # Optional: Handle negative values if needed
+                if (df[numeric_col] < 0).any():
+                    self.logger.warning(f"Column '{numeric_col}' contains negative values.")
+                # Drop rows where numeric conversion failed
+                original_count = len(df)
+                df.dropna(subset=[numeric_col], inplace=True)
+                if len(df) < original_count:
+                    self.logger.warning(f"Dropped {original_count - len(df)} rows due to invalid numeric format in '{numeric_col}'.")
+                self.logger.debug(f"Successfully converted '{numeric_col}' to numeric.")
+            except Exception as e:
+                 self.logger.error(f"Error converting column '{numeric_col}' to numeric: {e}", exc_info=True)
+                 # Decide how to handle: return None, drop column, fill with 0?
+                 return None # Safest default
+        else:
+            self.logger.warning(f"Numeric column '{numeric_col}' not found, skipping conversion.")
+
+        # 3. Handle String Types (and fill NaNs)
+        string_cols = ['Employee Identifier', 'Project Code', 'Task Description']
+        for col in string_cols:
+            if col in df.columns:
+                df[col] = df[col].astype(str).fillna('') # Ensure string type, fill missing
+            else:
+                 self.logger.warning(f"Expected string column '{col}' not found.")
+
+        # 4. Rename columns to match DB schema using COLUMN_MAPPING
+        df_renamed = df.rename(columns=self.COLUMN_MAPPING)
+        self.logger.debug(f"Columns renamed using mapping: {self.COLUMN_MAPPING}")
+
+        # 5. Select only the columns defined in the mapping's values (target DB columns)
+        final_columns = [db_col for db_col in self.COLUMN_MAPPING.values() if db_col in df_renamed.columns]
+        df_final = df_renamed[final_columns]
+        self.logger.debug(f"Selected final columns for DB: {final_columns}")
+
+        self.logger.info("Data transformation completed successfully.")
+        return df_final
+
+# Main execution block (optional, for direct testing)
+if __name__ == "__main__":
+    # Example of how to run this processor directly
+    logging.basicConfig(level=logging.DEBUG) # Set to DEBUG for detailed logs
+    logger = logging.getLogger(__name__)
+    logger.info("Running ChargedHoursIngestion directly for testing...")
+
+    # Create dummy data file path and DB path
+    # IMPORTANT: Replace with actual paths to your dummy files for testing
+    dummy_source_file = 'data/dummy_charged_hours.xlsx' # Path to your test Excel file
+    dummy_db_file = 'data/test_database.db'           # Path to a test database file
+
+    # Ensure dummy file exists (basic check)
+    import os
+    if not os.path.exists(dummy_source_file):
+         logger.error(f"Dummy source file not found: {dummy_source_file}")
+         sys.exit(1)
+
+    # Create an instance of the processor
+    processor = ChargedHoursIngestion(source_file_path=dummy_source_file, db_path=dummy_db_file)
+
+    # Run the process method (assuming it's defined in BaseDataProcessor)
+    logger.info("Calling processor.process()...")
+    try:
+        success = processor.process() # process() likely calls read_source, transform_data, load_to_db
+        if success:
+            logger.info("Direct test run completed successfully.")
+        else:
+            logger.error("Direct test run failed.")
+    except AttributeError:
+        logger.error("The 'process' method might be missing (potentially in BaseDataProcessor).")
+        logger.error("Cannot run direct test without a .process() method.")
+    except Exception as e:
+        logger.error(f"An error occurred during direct test run: {e}", exc_info=True)

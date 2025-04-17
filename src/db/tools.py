@@ -7,11 +7,11 @@ import logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 # Define the database path relative to the project root
-# Assumes the script is run from the project root or adjusts path accordingly
-DB_DIR = os.path.join(os.path.dirname(__file__), '..', '..', 'db') 
-DB_PATH = os.path.join(DB_DIR, 'database.db')
+# Aligning with the path used by ingestion processors
+DB_DIR = os.path.join(os.path.dirname(__file__), '..', '..', 'data') 
+DB_PATH = os.path.join(DB_DIR, 'operational_data.db')
 
-# Ensure the db directory exists
+# Ensure the db directory exists (now checking 'data' directory)
 os.makedirs(DB_DIR, exist_ok=True)
 
 def get_db_connection(db_path=DB_PATH):
@@ -19,7 +19,7 @@ def get_db_connection(db_path=DB_PATH):
 
     Args:
         db_path (str, optional): The path to the database file. 
-                                 Defaults to DB_PATH.
+                                 Defaults to DB_PATH (data/operational_data.db).
 
     Returns:
         sqlite3.Connection: A connection object to the database.
@@ -41,7 +41,7 @@ def execute_query(query: str, params: tuple = None, db_path: str = DB_PATH) -> p
         params (tuple, optional): A tuple of parameters to substitute into the query 
                                   (for safe parameterized queries). Defaults to None.
         db_path (str, optional): The path to the database file. 
-                                 Defaults to DB_PATH.
+                                 Defaults to DB_PATH (data/operational_data.db).
 
     Returns:
         pd.DataFrame | None: A DataFrame containing the query results, 

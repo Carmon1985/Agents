@@ -2,170 +2,148 @@ import pandas as pd
 import logging
 import os
 import sqlite3
+import sys
+from src.db.schema_setup import get_db_connection # Import the shared connection function
+from .base_processor import BaseDataProcessor # Assuming a base class exists
+
+# Add logging setup
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(name)s - %(message)s')
+logger = logging.getLogger(__name__)
 
 from .data_ingestion import DataIngestion, DEFAULT_FILE_PATHS, DEFAULT_DB_PATH
 
-class TargetsIngestion(DataIngestion):
-    """
-    Concrete implementation for ingesting Targets data.
-    Reads from an XLSX file, transforms the data based on defined dimensions
-    and metrics, and loads it into the 'targets' table.
-    """
+# Define expected columns and renaming map to match dummy_targets.xlsx headers
+EXPECTED_COLUMNS = [
+    'Employee Identifier',
+    'Target Date',
+    'Target Utilization Pct',
+    'Notes'
+]
+CRITICAL_SOURCE_COLUMNS = [
+    'Employee Identifier',
+    'Target Date',
+    'Target Utilization Pct'
+]
+COLUMN_MAPPING = {
+    'Employee Identifier': 'employee_id',
+    'Target Date': 'date',
+    'Target Utilization Pct': 'target_utilization',
+    'Notes': 'notes'
+}
 
-    # Define source column names and their target DB column names
-    COLUMN_MAPPING = {
-        'Target Year': 'target_year',
-        'Target Month': 'target_month',
-        'Employee Category': 'employee_category',
-        'Employee Competency': 'employee_competency',
-        'Employee Location': 'employee_location',
-        'Employee Billing Rank': 'employee_billing_rank',
-        'Target Utilization Percentage': 'target_utilization_percentage',
-        'Target Charged Hours per FTE': 'target_charged_hours_per_fte', # Optional
-        'Target Headcount (FTE)': 'target_headcount_fte' # Optional
-    }
-    
-    # All dimension columns are critical as they form the composite PK
-    CRITICAL_SOURCE_COLUMNS = [
-        'Target Year', 
-        'Target Month', 
-        'Employee Category', 
-        'Employee Competency', 
-        'Employee Location', 
-        'Employee Billing Rank'
-    ]
-    
+class TargetsIngestion(BaseDataProcessor):
+    """Handles ingestion of Targets data from XLSX to SQLite."""
+
+    # Define constants specific to this processor
+    EXPECTED_COLUMNS = EXPECTED_COLUMNS
+    CRITICAL_SOURCE_COLUMNS = CRITICAL_SOURCE_COLUMNS
+    COLUMN_MAPPING = COLUMN_MAPPING
     TARGET_TABLE = 'targets'
 
-    def read_source(self) -> pd.DataFrame:
-        """Reads the Targets XLSX file (first sheet) into a pandas DataFrame."""
-        try:
-            # Read from Excel file, assuming data is on the first sheet
-            df = pd.read_excel(self.source_file_path, sheet_name=0)
-            self.logger.info(f"Read {len(df)} rows from {self.source_file_path}")
-
-            # Find actual columns present in the source file
-            self.actual_columns = {k: v for k, v in self.COLUMN_MAPPING.items() if k in df.columns}
-            if not self.actual_columns:
-                 raise ValueError(f"Source file {self.source_file_path} contains none of the expected Targets columns.")
-
-            # Check if all critical dimension columns are present
-            missing_critical = [col for col in self.CRITICAL_SOURCE_COLUMNS if col not in self.actual_columns]
-            if missing_critical:
-                 raise ValueError(f"Source file {self.source_file_path} is missing critical dimension columns required for primary key: {missing_critical}")
-
-            return df
-        except FileNotFoundError:
-            self.logger.error(f"Source file not found: {self.source_file_path}")
-            raise
-        except Exception as e:
-            # Catch broader exceptions that might occur with Excel reading (e.g., xlrd missing, file corruption)
-            self.logger.error(f"Error reading Excel file {self.source_file_path}: {e}")
-            raise
-
     def transform_data(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Transforms the raw Targets data."""
-        self.logger.debug("Starting Targets data transformation...")
-        
-        # Select only the columns found in the source file
-        source_cols_to_use = list(self.actual_columns.keys())
-        df_selected = df[source_cols_to_use].copy()
+        """Transforms the raw DataFrame: parses dates, converts types, renames columns."""
+        if df is None:
+            self.logger.warning("Input DataFrame for transformation is None.")
+            return None
 
-        # Rename columns based on the mapping
-        rename_map = {k: v for k, v in self.actual_columns.items()}
-        df_transformed = df_selected.rename(columns=rename_map)
-        self.logger.debug("Renamed columns.")
+        self.logger.info(f"Starting transformation for {self.__class__.__name__}...")
 
-        # --- Data Type Conversion and Cleaning ---
-        # Convert year and month to integers
-        for col in ['target_year', 'target_month']:
-            if col in df_transformed.columns:
-                # Use Int64 to handle potential NaNs before dropping
-                df_transformed[col] = pd.to_numeric(df_transformed[col], errors='coerce').astype('Int64')
-                self.logger.debug(f"Converted {col} to integer.")
+        # Ensure critical columns are present
+        missing_critical = [col for col in self.CRITICAL_SOURCE_COLUMNS if col not in df.columns]
+        if missing_critical:
+            self.logger.error(f"Critical columns missing for transformation: {missing_critical}")
+            return None
 
-        # Convert dimension columns to strings and strip whitespace, handling None/NaN
-        dimension_cols = ['employee_category', 'employee_competency', 'employee_location', 'employee_billing_rank']
-        for col in dimension_cols:
-             if col in df_transformed.columns:
-                 df_transformed[col] = df_transformed[col].fillna('__NA__').astype(str).str.strip()
-                 df_transformed[col] = df_transformed[col].replace({'': None, 'None': None, 'nan': None, 'NaT': None, '__NA__': None})
-        self.logger.debug("Cleaned dimension string columns.")
-                 
-        # Convert target metric columns to numeric (REAL)
-        metric_cols = ['target_utilization_percentage', 'target_charged_hours_per_fte', 'target_headcount_fte']
-        for col in metric_cols:
-            if col in df_transformed.columns:
-                df_transformed[col] = pd.to_numeric(df_transformed[col], errors='coerce')
-                self.logger.debug(f"Converted {col} to numeric.")
+        # 1. Handle Dates ('Target Date')
+        date_col = 'Target Date'
+        if date_col in df.columns:
+            try:
+                df[date_col] = pd.to_datetime(df[date_col], errors='coerce', infer_datetime_format=True)
+                original_count = len(df)
+                df.dropna(subset=[date_col], inplace=True)
+                if len(df) < original_count:
+                     self.logger.warning(f"Dropped {original_count - len(df)} rows due to invalid date formats in '{date_col}'.")
+                df[date_col] = df[date_col].dt.strftime('%Y-%m-%d')
+                self.logger.debug(f"Successfully parsed and formatted '{date_col}'.")
+            except Exception as e:
+                self.logger.error(f"Error processing date column '{date_col}': {e}", exc_info=True)
+                return None
+        else:
+            self.logger.error(f"Critical date column '{date_col}' not found.")
+            return None
 
-        # --- Handle missing critical values (PK components) --- 
-        initial_rows = len(df_transformed)
-        critical_db_cols = [
-            'target_year', 'target_month', 'employee_category', 
-            'employee_competency', 'employee_location', 'employee_billing_rank'
-        ]
-        # Drop rows where any critical column is None/NaT AFTER conversions and cleaning
-        df_transformed.dropna(subset=critical_db_cols, inplace=True)
-        
-        final_rows = len(df_transformed)
-        if initial_rows != final_rows:
-            self.logger.warning(f"Dropped {initial_rows - final_rows} rows due to missing critical dimension data required for primary key. ")
+        # 2. Handle Numeric Types ('Target Utilization Pct')
+        numeric_col = 'Target Utilization Pct'
+        if numeric_col in df.columns:
+            try:
+                df[numeric_col] = pd.to_numeric(df[numeric_col], errors='coerce')
+                # Validate range (e.g., 0-100)
+                # Check for NaN before comparison
+                valid_range_mask = df[numeric_col].between(0, 100, inclusive='both')
+                if not df[numeric_col].isna().all() and not valid_range_mask[~df[numeric_col].isna()].all():
+                     self.logger.warning(f"Column '{numeric_col}' contains values outside the 0-100 range.")
+                     # Decide if invalid values should be dropped or capped
+                     # df.loc[~valid_range_mask, numeric_col] = None # Option: Set invalid to NaN
+                     # df[numeric_col] = df[numeric_col].clip(0, 100) # Option: Cap values
+                original_count = len(df)
+                df.dropna(subset=[numeric_col], inplace=True) # Drop rows where conversion failed (NaN)
+                if len(df) < original_count:
+                    self.logger.warning(f"Dropped {original_count - len(df)} rows due to invalid numeric format or out-of-range values in '{numeric_col}'.")
+                self.logger.debug(f"Successfully converted '{numeric_col}' to numeric.")
+            except Exception as e:
+                 self.logger.error(f"Error converting column '{numeric_col}' to numeric: {e}", exc_info=True)
+                 return None
+        else:
+             self.logger.error(f"Critical numeric column '{numeric_col}' not found.")
+             return None
 
-        # --- Final Schema Alignment ---
-        expected_db_cols = list(self.COLUMN_MAPPING.values())
-        for col in expected_db_cols:
-            if col not in df_transformed.columns:
-                df_transformed[col] = None # Add missing optional metric columns
-                self.logger.debug(f"Added missing target column '{col}' with None values.")
-        
-        # Ensure final integer types for PK after dropping NaNs
-        for col in ['target_year', 'target_month']:
-             if col in df_transformed.columns:
-                 df_transformed[col] = df_transformed[col].astype(int)
-                 
-        # Reorder columns
-        df_transformed = df_transformed[expected_db_cols]
+        # 3. Handle String Types
+        string_cols = ['Employee Identifier', 'Notes']
+        for col in string_cols:
+            if col in df.columns:
+                df[col] = df[col].astype(str).fillna('')
+            else:
+                 if col in self.EXPECTED_COLUMNS and col not in self.CRITICAL_SOURCE_COLUMNS:
+                    self.logger.warning(f"Expected string column '{col}' not found.")
 
-        self.logger.info("Targets data transformation completed.")
-        return df_transformed
+        # 4. Rename columns
+        df_renamed = df.rename(columns=self.COLUMN_MAPPING)
+        self.logger.debug(f"Columns renamed using mapping: {self.COLUMN_MAPPING}")
 
-    def load_to_db(self, df: pd.DataFrame):
-        """Loads the transformed Targets data into the SQLite targets table."""
-        if df.empty:
-            self.logger.warning("Transformed Targets DataFrame is empty. No data to load.")
-            return
-            
-        self.logger.info(f"Loading {len(df)} rows into table '{self.TARGET_TABLE}' using 'replace' strategy.")
-        
-        try:
-            df.to_sql(self.TARGET_TABLE, 
-                      self.conn, 
-                      if_exists='replace', 
-                      index=False, # Crucial for composite primary key
-                     )
-            self.logger.info(f"Successfully loaded data into '{self.TARGET_TABLE}'.")
-        except sqlite3.IntegrityError as e:
-            # This would likely indicate duplicate dimension combinations in the source file
-            self.logger.error(f"Database integrity error during load: {e}. Possible duplicate dimension combinations (Year, Month, Category, etc.) in source data?")
-            raise
-        except Exception as e:
-            self.logger.error(f"Error loading data into table '{self.TARGET_TABLE}': {e}")
-            raise
+        # 5. Select final columns based on the target DB schema
+        final_columns = [db_col for db_col in self.COLUMN_MAPPING.values() if db_col in df_renamed.columns]
+        df_final = df_renamed[final_columns]
+        self.logger.debug(f"Selected final columns for DB: {final_columns}")
 
-# Allow running this processor directly
-if __name__ == '__main__':
-    logging.info("Running Targets Ingestion Processor directly...")
-    # Adjusted to expect .xlsx by default
-    source_path = DEFAULT_FILE_PATHS.get('targets') 
-    db_path = DEFAULT_DB_PATH
-    
-    if not source_path:
-        logging.error("Default path for 'targets' not found.")
-    # Update the expected extension in the check and error message
-    elif not os.path.exists(source_path) or not source_path.endswith('.xlsx'): 
-         logging.error(f"Source Excel file not found at expected path: {source_path}. Ensure it ends with .xlsx")
+        self.logger.info("Data transformation completed successfully.")
+        return df_final
+
+# Main execution block
+if __name__ == "__main__":
+    logger.info("[targets_processor] - Running Targets Ingestion Processor directly...")
+
+    # --- Argument Handling ---
+    input_file_path = None
+    if len(sys.argv) > 1:
+        input_file_path = sys.argv[1]
+        logger.info(f"Input file path provided via argument: {input_file_path}")
     else:
-        processor = TargetsIngestion(source_file_path=source_path, db_path=db_path)
-        processor.process()
-        logging.info("Targets Ingestion Processor finished.") 
+        default_path = os.path.join("data", "source", "targets.xlsx") # Define default
+        logger.warning(f"No input file path provided via argument. Using default: {default_path}")
+        input_file_path = default_path
+        
+    db_path = DEFAULT_DB_PATH
+    logger.info(f"Using database path: {db_path}")
+
+    if not os.path.exists(input_file_path):
+        logger.error(f"Source Excel file not found at path: {input_file_path}. Please provide a valid path.")
+        sys.exit(1)
+        
+    # Instantiate and run the processor (using only expected init args)
+    processor = TargetsIngestion(
+        source_file_path=input_file_path, 
+        db_path=db_path
+    )
+    # Use the correct method name
+    processor.process()
+    logger.info("Targets Ingestion Processor finished.") 

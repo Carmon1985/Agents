@@ -1,167 +1,163 @@
 import pandas as pd
 import logging
-import os
 import sqlite3
+import sys
+from .base_processor import BaseDataProcessor # Assuming a base class exists
 
-from .data_ingestion import DataIngestion, DEFAULT_FILE_PATHS, DEFAULT_DB_PATH
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(name)s - %(message)s')
+logger = logging.getLogger(__name__)
 
-class MasterFileIngestion(DataIngestion):
-    """
-    Concrete implementation for ingesting Employee Master File data.
-    Reads from an XLSX file, transforms the data, and loads it into the
-    'employees' table in the SQLite database.
-    """
+class MasterFileIngestion(BaseDataProcessor):
+    """Handles ingestion of Master File data (capacity, employee info) from XLSX to SQLite."""
 
-    # Define potential source column names and their target DB column names
-    # Prioritize names based on likelihood or preference if multiple source names map to one target
+    # Define source columns expected in the Excel file
+    # Adjusted based on previous errors and schema_setup
+    EXPECTED_COLUMNS = [
+        'Employee Identifier', # Changed from 'Employee ID'
+        'Date',                # Keep as 'Date' if this is the source column
+        'Capacity Hours',
+        'Employee Name',
+        'Department',
+        # 'Status' # Include if actually present and needed, otherwise remove
+    ]
+    # Define columns critical for validation
+    CRITICAL_SOURCE_COLUMNS = [
+        'Employee Identifier',
+        'Date',
+        'Capacity Hours'
+        # Add 'Status' here ONLY if it's truly critical and expected
+    ]
+    # Map source columns to database columns
     COLUMN_MAPPING = {
         'Employee Identifier': 'employee_id',
+        'Date': 'date',
+        'Capacity Hours': 'capacity_hours',
         'Employee Name': 'employee_name',
-        'Status': 'status',
-        'Standard Hours Per Week': 'standard_hours_per_week', # Prioritize this
-        'Effective STD Hrs per Week': 'standard_hours_per_week', # Alternative
-        'Employee Category': 'employee_category',
-        'Employee Competency': 'employee_competency', # Prioritize this
-        'Primary Skill Group': 'employee_competency', # Alternative
-        'Employee Location': 'employee_location', # Prioritize this
-        'Office': 'employee_location', # Alternative
-        'Employee Billing Rank': 'employee_billing_rank', # Prioritize this
-        'Level': 'employee_billing_rank', # Alternative
-        'Grade': 'employee_billing_rank', # Alternative
-        'Department': 'department', # Prioritize this
-        'Practice Area': 'department', # Alternative
-        'Region': 'region'
+        'Department': 'department'
+        # 'Status': 'status' # Add mapping ONLY if 'status' column exists in DB schema
     }
-    
-    CRITICAL_SOURCE_COLUMNS = [
-        'Employee Identifier', 
-        'Employee Name', 
-        'Status'
-    ]
-    
-    TARGET_TABLE = 'employees'
+    # Define the target database table
+    TARGET_TABLE = 'master_file'
 
-    def read_source(self) -> pd.DataFrame:
-        """Reads the Master File XLSX file into a pandas DataFrame."""
-        try:
-            # Assuming data is on the first sheet
-            df = pd.read_excel(self.source_file_path, sheet_name=0)
-            self.logger.info(f"Read {len(df)} rows from {self.source_file_path}")
+    # --- The conflicting __init__, validate_data, save_to_db, process methods are removed --- 
+    # --- Assuming they are handled by BaseDataProcessor or were incorrect additions ---
 
-            # Find which of the potential source columns actually exist in the DataFrame
-            self.actual_columns = {k: v for k, v in self.COLUMN_MAPPING.items() if k in df.columns}
-            if not self.actual_columns:
-                 raise ValueError(f"Source file {self.source_file_path} contains none of the expected columns.")
-
-            # Check if critical columns are present among the found columns
-            missing_critical = [col for col in self.CRITICAL_SOURCE_COLUMNS if col not in self.actual_columns]
-            if missing_critical:
-                 raise ValueError(f"Source file {self.source_file_path} is missing critical columns: {missing_critical}")
-
-            return df
-        except FileNotFoundError:
-            self.logger.error(f"Source file not found: {self.source_file_path}")
-            raise
-        except Exception as e:
-            self.logger.error(f"Error reading Excel file {self.source_file_path}: {e}")
-            raise
+    # Keep the original read_source if it existed, or rely on BaseDataProcessor
+    # def read_source(self) -> pd.DataFrame:
+    #     """Reads the Master File XLSX file into a pandas DataFrame."""
+    #     # ... (Implementation likely involves pd.read_excel(self.source_file_path)) ...
+    #     # Check for critical columns here as per the ValueError
+    #     df = super().read_source()
+    #     missing_critical = [col for col in self.CRITICAL_SOURCE_COLUMNS if col not in df.columns]
+    #     if missing_critical:
+    #          raise ValueError(f"Source file {self.source_file_path} is missing critical columns: {missing_critical}")
+    #     return df
 
     def transform_data(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Transforms the raw Master File data."""
-        self.logger.debug("Starting data transformation...")
-        
-        # Select only the columns found in the source file
-        source_cols_to_use = list(self.actual_columns.keys())
-        df_selected = df[source_cols_to_use].copy()
+        """Transforms the raw DataFrame: parses dates, converts types, renames columns."""
+        if df is None:
+            self.logger.warning("Input DataFrame for transformation is None.")
+            return None
 
-        # Rename columns based on the mapping derived in read_source
-        rename_map = {k: v for k, v in self.actual_columns.items()}
-        df_transformed = df_selected.rename(columns=rename_map)
-        self.logger.debug("Renamed columns.")
+        self.logger.info(f"Starting transformation for {self.__class__.__name__}...")
 
-        # --- Data Type Conversion and Cleaning ---
-        # Convert standard_hours_per_week to numeric if the column exists
-        if 'standard_hours_per_week' in df_transformed.columns:
-            df_transformed['standard_hours_per_week'] = pd.to_numeric(df_transformed['standard_hours_per_week'], errors='coerce')
-            self.logger.debug("Converted standard_hours_per_week to numeric.")
-            
-        # Clean ALL string columns (critical and optional) robustly first
-        string_cols = [
-            'employee_id', 'employee_name', 'status', 'employee_category',
-            'employee_competency', 'employee_location', 'employee_billing_rank',
-            'department', 'region'
-        ]
+        # Ensure critical columns are present
+        missing_critical = [col for col in self.CRITICAL_SOURCE_COLUMNS if col not in df.columns]
+        if missing_critical:
+            self.logger.error(f"Critical columns missing for transformation: {missing_critical}")
+            return None
+
+        # 1. Handle Dates ('Date')
+        date_col = 'Date'
+        if date_col in df.columns:
+            try:
+                df[date_col] = pd.to_datetime(df[date_col], errors='coerce', infer_datetime_format=True)
+                original_count = len(df)
+                df.dropna(subset=[date_col], inplace=True)
+                if len(df) < original_count:
+                    self.logger.warning(f"Dropped {original_count - len(df)} rows due to invalid date formats in '{date_col}'.")
+                df[date_col] = df[date_col].dt.strftime('%Y-%m-%d')
+                self.logger.debug(f"Successfully parsed and formatted '{date_col}'.")
+            except Exception as e:
+                self.logger.error(f"Error processing date column '{date_col}': {e}", exc_info=True)
+                return None
+        else:
+            # This check might be redundant if Date is in CRITICAL_SOURCE_COLUMNS
+            self.logger.error(f"Critical date column '{date_col}' not found.")
+            return None
+
+        # 2. Handle Numeric Types ('Capacity Hours')
+        numeric_col = 'Capacity Hours'
+        if numeric_col in df.columns:
+            try:
+                df[numeric_col] = pd.to_numeric(df[numeric_col], errors='coerce')
+                if (df[numeric_col] <= 0).any():
+                    self.logger.warning(f"Column '{numeric_col}' contains non-positive values.")
+                original_count = len(df)
+                df.dropna(subset=[numeric_col], inplace=True)
+                if len(df) < original_count:
+                     self.logger.warning(f"Dropped {original_count - len(df)} rows due to invalid numeric format in '{numeric_col}'.")
+                self.logger.debug(f"Successfully converted '{numeric_col}' to numeric.")
+            except Exception as e:
+                 self.logger.error(f"Error converting column '{numeric_col}' to numeric: {e}", exc_info=True)
+                 return None
+        else:
+             # This check might be redundant if Capacity Hours is critical
+             self.logger.error(f"Critical numeric column '{numeric_col}' not found.")
+             return None
+
+        # 3. Handle String Types
+        string_cols = ['Employee Identifier', 'Employee Name', 'Department'] # Add 'Status' if needed
         for col in string_cols:
-            if col in df_transformed.columns:
-                # Use fillna before astype, then strip and replace invalid/empty strings with None
-                df_transformed[col] = df_transformed[col].fillna('__NA__').astype(str).str.strip()
-                df_transformed[col] = df_transformed[col].replace(
-                    {'': None, 'None': None, 'nan': None, 'NaT': None, '<NA>': None, '__NA__': None}
-                )
-        self.logger.debug("Cleaned and standardized all potential string columns.")
+            if col in df.columns:
+                df[col] = df[col].astype(str).fillna('')
+            else:
+                # Log warning only if column is expected but not critical
+                if col in self.EXPECTED_COLUMNS and col not in self.CRITICAL_SOURCE_COLUMNS:
+                    self.logger.warning(f"Expected string column '{col}' not found.")
 
-        # --- Handle missing values --- 
-        initial_rows = len(df_transformed)
-        critical_str_cols = ['employee_id', 'employee_name', 'status']
-        # Drop rows where ANY critical column is None (after cleaning)
-        df_transformed.dropna(subset=critical_str_cols, inplace=True)
+        # 4. Rename columns
+        df_renamed = df.rename(columns=self.COLUMN_MAPPING)
+        self.logger.debug(f"Columns renamed using mapping: {self.COLUMN_MAPPING}")
 
-        final_rows = len(df_transformed)
-        if initial_rows != final_rows:
-            self.logger.warning(f"Dropped {initial_rows - final_rows} rows due to missing critical data (ID, Name, or Status). ")
+        # 5. Select final columns
+        final_columns = [db_col for db_col in self.COLUMN_MAPPING.values() if db_col in df_renamed.columns]
+        df_final = df_renamed[final_columns]
+        self.logger.debug(f"Selected final columns for DB: {final_columns}")
 
-        # --- Final Schema Alignment ---
-        # Ensure all target columns exist, adding any missing ones with None/NULL values
-        expected_db_cols = [
-            'employee_id', 'employee_name', 'status', 'standard_hours_per_week', 
-            'employee_category', 'employee_competency', 'employee_location', 
-            'employee_billing_rank', 'department', 'region'
-        ]
-        for col in expected_db_cols:
-            if col not in df_transformed.columns:
-                df_transformed[col] = None
-                self.logger.debug(f"Added missing target column '{col}' with None values.")
-                
-        # Reorder columns to match the canonical schema order (optional but good practice)
-        df_transformed = df_transformed[expected_db_cols]
+        self.logger.info("Data transformation completed successfully.")
+        return df_final
 
-        self.logger.info("Data transformation completed.")
-        return df_transformed
+    # Keep the original load_to_db if it existed, or rely on BaseDataProcessor
+    # def load_to_db(self, df: pd.DataFrame) -> bool:
+    #    return super().load_to_db(df)
 
-    def load_to_db(self, df: pd.DataFrame):
-        """Loads the transformed Master File data into the SQLite employees table."""
-        if df.empty:
-            self.logger.warning("Transformed DataFrame is empty. No data to load.")
-            return
-            
-        self.logger.info(f"Loading {len(df)} rows into table '{self.TARGET_TABLE}' using 'replace' strategy.")
-        
-        try:
-            df.to_sql(self.TARGET_TABLE, 
-                      self.conn, 
-                      if_exists='replace', 
-                      index=False
-                     )
-            self.logger.info(f"Successfully loaded data into '{self.TARGET_TABLE}'.")
-        except sqlite3.IntegrityError as e:
-            # Primary key violations (duplicate employee_id) might occur if source isn't clean
-            self.logger.error(f"Database integrity error during load: {e}. Possible duplicate Employee IDs in source data?")
-            raise
-        except Exception as e:
-            self.logger.error(f"Error loading data into table '{self.TARGET_TABLE}': {e}")
-            raise
+# Main execution block (for direct testing)
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.DEBUG)
+    logger = logging.getLogger(__name__)
+    logger.info("Running MasterFileIngestion directly for testing...")
 
-# Allow running this processor directly
-if __name__ == '__main__':
-    logging.info("Running Master File Ingestion Processor directly...")
-    source_path = DEFAULT_FILE_PATHS.get('master_file')
-    db_path = DEFAULT_DB_PATH
-    
-    if not source_path:
-        logging.error("Default path for 'master_file' not found.")
-    elif not os.path.exists(source_path):
-         logging.error(f"Source file not found at default path: {source_path}.")
-    else:
-        processor = MasterFileIngestion(source_file_path=source_path, db_path=db_path)
-        processor.process()
-        logging.info("Master File Ingestion Processor finished.") 
+    dummy_source_file = 'data/dummy_master_file.xlsx'
+    dummy_db_file = 'data/test_database.db'
+
+    import os
+    if not os.path.exists(dummy_source_file):
+         logger.error(f"Dummy source file not found: {dummy_source_file}")
+         sys.exit(1)
+
+    processor = MasterFileIngestion(source_file_path=dummy_source_file, db_path=dummy_db_file)
+
+    logger.info("Calling processor.process()...")
+    try:
+        # Assuming process() exists in BaseDataProcessor
+        success = processor.process()
+        if success:
+            logger.info("Direct test run completed successfully.")
+        else:
+            logger.error("Direct test run failed.")
+    except AttributeError:
+         logger.error("The 'process' method might be missing (potentially in BaseDataProcessor).")
+    except Exception as e:
+        logger.error(f"An error occurred during direct test run: {e}", exc_info=True)
