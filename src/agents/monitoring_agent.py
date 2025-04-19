@@ -13,8 +13,11 @@ from autogen import AssistantAgent, UserProxyAgent
 from autogen.agentchat import GroupChat, GroupChatManager
 import pandas as pd
 import logging
-from typing import Optional # Import Optional for type hinting
+from typing import Optional, Dict, Any, List, Tuple
 import json # Import json for structured output
+from datetime import datetime, timedelta
+import numpy as np
+from scipy import stats
 
 # Load environment variables
 load_dotenv()
@@ -247,8 +250,8 @@ user_proxy = autogen.UserProxyAgent(
    name="User_Proxy",
    human_input_mode="NEVER", # Agent executes functions without asking
    max_consecutive_auto_reply=10, # Limit consecutive replies
-   # Check if the message content indicates termination
-   is_termination_msg=lambda x: isinstance(x, dict) and "TERMINATE" in x.get("content", "").upper(),
+   # Updated lambda to safely handle None content
+   is_termination_msg=lambda x: isinstance(x, dict) and isinstance(x.get("content"), str) and "TERMINATE" in x.get("content", "").upper(),
    code_execution_config=False, # No code execution needed here
    # Register BOTH functions with the User Proxy agent
    function_map={
@@ -295,3 +298,634 @@ if __name__ == "__main__":
         logger.error(f"An unexpected error occurred during chat execution: {e}", exc_info=True)
 
     logger.info("Script finished.")
+
+class MonitoringAgent(autogen.AssistantAgent):
+    """Agent that monitors system resources and generates alerts."""
+
+    def __init__(
+        self,
+        llm_config: Optional[Dict[str, Any]] = None,
+        deviation_thresholds: Optional[Dict[str, float]] = None,
+        name: str = "MonitoringAgent",
+        system_message: Optional[str] = None,
+        **kwargs
+    ):
+        """Initialize the MonitoringAgent with configuration and thresholds.
+
+        Args:
+            llm_config (Optional[Dict[str, Any]]): Configuration for the LLM. Must contain 'config_list'.
+            deviation_thresholds (Optional[Dict[str, float]]): Thresholds for deviation alerts.
+                Must include 'critical' and 'warning' keys with positive float values.
+            name (str): Name of the agent. Defaults to "MonitoringAgent".
+            system_message (Optional[str]): System message for the agent.
+            **kwargs: Additional arguments passed to the parent class.
+        
+        Raises:
+            ValueError: If llm_config or deviation_thresholds are invalid.
+        """
+        # Initialize metrics cache
+        self.metrics_cache = {}
+
+        # Validate llm_config
+        if not isinstance(llm_config, dict):
+            raise ValueError("llm_config must be a dictionary containing 'config_list'")
+        if 'config_list' not in llm_config:
+            raise ValueError("llm_config must be a dictionary containing 'config_list'")
+        if not llm_config['config_list']:
+            raise ValueError("llm_config must be a dictionary containing 'config_list'")
+
+        # Set default thresholds
+        default_thresholds = {
+            "critical": 10.0,
+            "warning": 5.0,
+            "z_score": 2.0,
+            "trend": 0.1,
+            "correlation": 0.7
+        }
+
+        # Validate deviation_thresholds if provided
+        if deviation_thresholds is not None:
+            if not isinstance(deviation_thresholds, dict):
+                raise ValueError("deviation_thresholds must be a dictionary")
+            
+            # Check for required keys
+            for key in ["critical", "warning"]:
+                if key not in deviation_thresholds:
+                    raise ValueError(f"Missing required threshold key: {key}")
+                
+                # Validate threshold values
+                if not isinstance(deviation_thresholds[key], (int, float)):
+                    raise ValueError(f"Invalid value for {key} threshold: must be a positive number")
+                if deviation_thresholds[key] <= 0:
+                    raise ValueError(f"Invalid value for {key} threshold: must be a positive number")
+            
+            # Update default thresholds with provided values
+            default_thresholds.update(deviation_thresholds)
+
+        self.deviation_thresholds = default_thresholds
+
+        # Initialize parent class with validated config
+        super().__init__(
+            name=name,
+            llm_config=llm_config,
+            system_message=system_message or "I am a monitoring agent that analyzes resource utilization and generates alerts.",
+            **kwargs
+        )
+
+    def detect_statistical_deviation(
+        self,
+        current_value: float,
+        historical_values: List[float]
+    ) -> Dict[str, Any]:
+        """
+        Detect statistical deviations using z-score and historical context.
+        
+        Args:
+            current_value: The current metric value
+            historical_values: List of historical values for the metric
+            
+        Returns:
+            Dictionary containing deviation analysis results
+        """
+        if not historical_values:
+            return {
+                "deviation_detected": False,
+                "reason": "Insufficient historical data",
+                "score": 0.0
+            }
+            
+        # Calculate basic statistics
+        mean = np.mean(historical_values)
+        std = np.std(historical_values)
+        
+        if std == 0:
+            return {
+                "deviation_detected": False,
+                "reason": "No variation in historical data",
+                "score": 0.0
+            }
+            
+        # Calculate z-score
+        z_score = (current_value - mean) / std
+        
+        # Determine if this is a significant deviation
+        is_significant = bool(abs(z_score) > self.deviation_thresholds["z_score"])
+        
+        # Calculate deviation score (0-10 scale)
+        score = min(10.0, abs(z_score) * (10.0 / self.deviation_thresholds["z_score"]))
+        
+        return {
+            "deviation_detected": is_significant,
+            "z_score": z_score,
+            "score": score,
+            "mean": mean,
+            "std": std,
+            "reason": f"Z-score of {z_score:.2f} {'exceeds' if is_significant else 'within'} threshold"
+        }
+        
+    def detect_trend_deviation(
+        self,
+        values: List[float],
+        dates: List[datetime]
+    ) -> Dict[str, Any]:
+        """
+        Detect deviations in trend using linear regression.
+        
+        Args:
+            values: List of metric values
+            dates: List of corresponding dates
+            
+        Returns:
+            Dictionary containing trend analysis results
+        """
+        if len(values) < 3:  # Need at least 3 points for meaningful trend
+            return {
+                "trend_detected": False,
+                "reason": "Insufficient data points",
+                "score": 0.0
+            }
+            
+        # Validate dates are in chronological order
+        for i in range(1, len(dates)):
+            if dates[i] <= dates[i-1]:
+                raise ValueError("Dates must be in chronological order")
+            
+        # Convert dates to numeric values (days since first date)
+        days = [(d - dates[0]).days for d in dates]
+        
+        # Perform linear regression
+        slope, intercept, r_value, p_value, std_err = stats.linregress(days, values)
+        
+        # Calculate trend score based on slope significance and R² value
+        r_squared = r_value ** 2
+        trend_score = min(10.0, abs(slope) * 100 * r_squared)
+        
+        # Determine if trend is significant
+        is_significant = bool(
+            abs(slope) > self.deviation_thresholds["trend"] and
+            p_value < 0.05 and
+            r_squared > 0.6
+        )
+        
+        return {
+            "trend_detected": is_significant,
+            "slope": slope,
+            "r_squared": r_squared,
+            "p_value": p_value,
+            "score": trend_score,
+            "direction": "increasing" if slope > 0 else "decreasing",
+            "reason": f"{'Significant' if is_significant else 'No significant'} trend detected (slope: {slope:.4f}, R²: {r_squared:.2f})"
+        }
+        
+    def detect_metric_correlations(
+        self,
+        metric_data: Dict[str, List[float]]
+    ) -> List[Dict[str, Any]]:
+        """
+        Detect correlations between different metrics.
+        
+        Args:
+            metric_data: Dictionary of metric names to their values
+            
+        Returns:
+            List of significant correlations found
+        """
+        correlations = []
+        metrics = list(metric_data.keys())
+        
+        if not metrics:
+            return correlations
+            
+        # Validate all metrics have the same number of values
+        first_metric_len = len(metric_data[metrics[0]])
+        for metric in metrics[1:]:
+            if len(metric_data[metric]) != first_metric_len:
+                raise ValueError("All metrics must have the same number of values")
+        
+        for i in range(len(metrics)):
+            for j in range(i + 1, len(metrics)):
+                metric1, metric2 = metrics[i], metrics[j]
+                values1, values2 = metric_data[metric1], metric_data[metric2]
+                
+                # Calculate correlation coefficient
+                correlation = np.corrcoef(values1, values2)[0, 1]
+                
+                # Check if correlation is significant
+                if abs(correlation) >= self.deviation_thresholds["correlation"]:
+                    correlations.append({
+                        "metrics": (metric1, metric2),
+                        "correlation": correlation,
+                        "strength": "strong positive" if correlation > 0 else "strong negative",
+                        "score": abs(correlation) * 10  # Scale to 0-10
+                    })
+                    
+        return correlations
+        
+    def _determine_alert_level(self, statistical_analysis: Dict[str, Any], trend_analysis: Dict[str, Any]) -> str:
+        """
+        Determine alert level based on statistical and trend analyses.
+        
+        Args:
+            statistical_analysis: Results from statistical deviation analysis
+            trend_analysis: Results from trend deviation analysis
+            
+        Returns:
+            Alert level ("CRITICAL", "WARNING", or None)
+        """
+        # Check scores from both analyses
+        stat_score = statistical_analysis.get("score", 0.0)
+        trend_score = trend_analysis.get("score", 0.0)
+        max_score = max(stat_score, trend_score)
+        
+        # Determine alert level based on thresholds
+        if max_score >= self.deviation_thresholds["critical"]:
+            return "CRITICAL"
+        elif max_score >= self.deviation_thresholds["warning"]:
+            return "WARNING"
+        
+        return None
+        
+    async def analyze_deviations(self, resource_id: str, current_metrics: dict, historical_metrics: dict, dates: list) -> dict:
+        """
+        Analyze deviations in metrics for a given resource.
+        
+        Args:
+            resource_id (str): Identifier for the resource being analyzed
+            current_metrics (dict): Current metric values
+            historical_metrics (dict): Historical metric values
+            dates (list): List of dates corresponding to historical metrics
+            
+        Returns:
+            dict: Analysis results including statistical deviations, trends, and correlations
+        """
+        try:
+            # Validate input
+            if not resource_id or not isinstance(resource_id, str):
+                return {
+                    "status": "error",
+                    "message": "Missing required metrics or resource ID",
+                    "resource_id": resource_id
+                }
+                
+            required_metrics = ["utilization", "charged_hours", "capacity_hours", "target_utilization"]
+            if not all(metric in current_metrics for metric in required_metrics):
+                return {
+                    "status": "error",
+                    "message": "Missing required metrics in current data",
+                    "resource_id": resource_id
+                }
+            
+            if not all(metric in historical_metrics for metric in required_metrics):
+                return {
+                    "status": "error",
+                    "message": "Missing required metrics in historical data",
+                    "resource_id": resource_id
+                }
+                
+            # Check for empty historical data
+            if not any(historical_metrics.values()):
+                return {
+                    "status": "error",
+                    "message": "Insufficient historical data for analysis",
+                    "resource_id": resource_id
+                }
+            
+            # Initialize result structure
+            result = {
+                "status": "success",
+                "resource_id": resource_id,
+                "metric_analyses": {},
+                "correlations": [],
+                "alert_level": "normal"
+            }
+            
+            overall_max_score = 0.0
+            
+            # Analyze each metric
+            for metric in required_metrics:
+                current_value = current_metrics[metric]
+                historical_values = historical_metrics[metric]
+                
+                # Skip analysis if insufficient data
+                if len(historical_values) < 2:
+                    continue
+                
+                # Perform statistical analysis
+                stat_analysis = self.detect_statistical_deviation(current_value, historical_values)
+                
+                # Perform trend analysis
+                trend_analysis = self.detect_trend_deviation(historical_values + [current_value], dates + [datetime.now()])
+                
+                # Determine alert level for this metric
+                alert_level = self._determine_alert_level(stat_analysis, trend_analysis)
+                
+                # Update overall max score
+                stat_score = stat_analysis.get("score", 0.0)
+                trend_score = trend_analysis.get("score", 0.0)
+                metric_max_score = max(stat_score, trend_score)
+                overall_max_score = max(overall_max_score, metric_max_score)
+                
+                # Store analysis results for this metric
+                result["metric_analyses"][metric] = {
+                    "statistical": stat_analysis,
+                    "trend": trend_analysis,
+                    "alert_level": alert_level,
+                    "statistical_analysis": {
+                        "reason": stat_analysis.get("reason", "Statistical analysis completed")
+                    }
+                }
+            
+            # Perform correlation analysis if sufficient data points
+            if len(dates) >= 5:
+                metric_data = {metric: historical_metrics[metric] + [current_metrics[metric]] 
+                             for metric in required_metrics}
+                correlations = self.detect_metric_correlations(metric_data)
+                result["correlations"] = correlations
+            
+            # Set overall alert level based on max score
+            if overall_max_score >= self.deviation_thresholds["critical"]:
+                result["alert_level"] = "critical"
+            elif overall_max_score >= self.deviation_thresholds["warning"]:
+                result["alert_level"] = "warning"
+            else:
+                result["alert_level"] = "normal"
+            
+            return result
+            
+        except Exception as e:
+            logging.error(f"Error in analyze_deviations: {str(e)}")
+            return {
+                "status": "error",
+                "message": f"Error analyzing deviations: {str(e)}",
+                "resource_id": resource_id
+            }
+
+    async def generate_alerts(self, analysis_results: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """
+        Generate alerts based on analysis results.
+
+        Args:
+            analysis_results: Dictionary containing analysis results
+
+        Returns:
+            List of alert dictionaries sorted by priority (CRITICAL > WARNING > INFO)
+        """
+        alerts = []
+        
+        # Return empty list if analysis failed or has no results
+        if not analysis_results or analysis_results.get("status") != "success":
+            return alerts
+            
+        # Process metric deviations
+        metric_analyses = analysis_results.get("metric_analyses", {})
+        for metric_name, analysis in metric_analyses.items():
+            alert_level = analysis.get("alert_level")
+            if alert_level in ["CRITICAL", "WARNING"]:
+                reason = analysis.get('statistical_analysis', {}).get('reason', 'Significant deviation detected')
+                alerts.append({
+                    "level": alert_level,
+                    "metric": metric_name,
+                    "message": f"{alert_level} alert for {metric_name}: {reason}",
+                    "details": analysis
+                })
+                
+        # Process correlations
+        correlations = analysis_results.get("correlations", [])
+        for correlation in correlations:
+            if correlation.get("score", 0) >= 7.0:  # High correlation threshold
+                metric1, metric2 = correlation.get("metrics", ("", ""))
+                correlation_value = correlation.get('correlation', 0)
+                alerts.append({
+                    "level": "INFO",
+                    "metric": f"{metric1}-{metric2}",
+                    "message": f"Strong correlation detected between {metric1} and {metric2} (correlation: {correlation_value:.2f})",
+                    "details": correlation
+                })
+                
+        # Sort alerts by priority (CRITICAL > WARNING > INFO)
+        priority_order = {"CRITICAL": 0, "WARNING": 1, "INFO": 2}
+        alerts.sort(key=lambda x: priority_order[x["level"]])
+        
+        return alerts
+
+    async def get_current_metrics(self, resource_id: str) -> Dict[str, float]:
+        """Get current metrics for a given resource."""
+        try:
+            # For testing purposes, if no data is available, return empty dict
+            if not resource_id:
+                return {}
+                
+            # Get period data
+            charged_hours, capacity_hours, target_ratio = get_period_data(
+                datetime.now().strftime("%Y-%m-%d"),
+                datetime.now().strftime("%Y-%m-%d"),
+                resource_id if resource_id != "all" else None
+            )
+            
+            # If any of the values are None, return empty dict
+            if any(v is None for v in [charged_hours, capacity_hours, target_ratio]):
+                return {}
+            
+            # Calculate utilization
+            utilization = (charged_hours / capacity_hours) * 100 if capacity_hours > 0 else 0
+            target_utilization = target_ratio * 100 if target_ratio else 0
+            
+            return {
+                "utilization": utilization,
+                "charged_hours": charged_hours,
+                "capacity_hours": capacity_hours,
+                "target_utilization": target_utilization
+            }
+        except Exception as e:
+            logger.error(f"Error getting current metrics: {e}")
+            return {}
+
+    async def _fetch_metrics(self) -> Dict[str, float]:
+        """Fetch current metrics from the monitoring system."""
+        # Mock implementation for testing
+        return {}
+
+    async def _fetch_historical_metrics(self, resource_id: str, start_date: datetime, end_date: datetime) -> Tuple[Dict[str, List[float]], List[datetime]]:
+        """Fetch historical metrics from the monitoring system."""
+        # Mock implementation for testing
+        return {}, []
+
+    async def get_historical_metrics(
+        self,
+        resource_id: str,
+        start_date: datetime,
+        end_date: datetime
+    ) -> Tuple[Dict[str, List[float]], List[datetime]]:
+        """
+        Get historical metric values for a resource.
+        
+        Args:
+            resource_id: Identifier for the resource (employee_id)
+            start_date: Start date for historical data
+            end_date: End date for historical data
+            
+        Returns:
+            Tuple containing a dictionary of metrics and a list of dates
+        """
+        if start_date >= end_date:
+            raise ValueError("Start date must be before end date")
+            
+        try:
+            historical_metrics = {}
+            dates = []
+            
+            # Collect monthly data points
+            current_date = start_date
+            while current_date <= end_date:
+                month_end = min(
+                    (current_date.replace(day=1) + timedelta(days=32)).replace(day=1) - timedelta(days=1),
+                    end_date
+                )
+                
+                # Format dates for query
+                start_str = current_date.strftime("%Y-%m-%d")
+                end_str = month_end.strftime("%Y-%m-%d")
+                
+                # Query utilization data for this month
+                charged_hours, capacity_hours, target_ratio = get_period_data(
+                    start_str,
+                    end_str,
+                    resource_id if resource_id != "all" else None
+                )
+                
+                # Calculate utilization for this month
+                if capacity_hours and capacity_hours > 0:
+                    utilization = (charged_hours / capacity_hours) * 100
+                    
+                    # Initialize metric lists if not already done
+                    if "utilization" not in historical_metrics:
+                        historical_metrics["utilization"] = []
+                    if "charged_hours" not in historical_metrics:
+                        historical_metrics["charged_hours"] = []
+                    if "capacity_hours" not in historical_metrics:
+                        historical_metrics["capacity_hours"] = []
+                    if "target_utilization" not in historical_metrics:
+                        historical_metrics["target_utilization"] = []
+                    
+                    # Add values to respective lists
+                    historical_metrics["utilization"].append(utilization)
+                    historical_metrics["charged_hours"].append(charged_hours)
+                    historical_metrics["capacity_hours"].append(capacity_hours)
+                    historical_metrics["target_utilization"].append(target_ratio * 100 if target_ratio else 0)
+                    dates.append(current_date)
+                
+                # Move to next month
+                current_date = (current_date.replace(day=1) + timedelta(days=32)).replace(day=1)
+            
+            return historical_metrics, dates
+            
+        except Exception as e:
+            logger.error(f"Error getting historical metrics for resource {resource_id}: {str(e)}")
+            raise
+
+    async def forecast_performance(
+        self,
+        resource_id: str,
+        num_history_months: int = 6,
+        forecast_window: int = 3
+    ) -> Dict[str, Any]:
+        """
+        Forecast future performance metrics using historical data.
+        
+        Args:
+            resource_id: Identifier for the resource to forecast for
+            num_history_months: Number of months of historical data to use
+            forecast_window: Number of recent months to use for the forecast calculation
+            
+        Returns:
+            Dictionary containing forecast results and confidence metrics
+        """
+        try:
+            # Calculate date ranges
+            end_date = datetime.now()
+            start_date = end_date - timedelta(days=30 * num_history_months)
+            
+            # Get historical metrics
+            historical_metrics, dates = await self.get_historical_metrics(resource_id, start_date, end_date)
+            
+            if not historical_metrics or not dates:
+                return {
+                    "status": "error",
+                    "error": "No historical data available for forecasting"
+                }
+            
+            # Get utilization data for forecasting
+            if "utilization" not in historical_metrics:
+                return {
+                    "status": "error",
+                    "error": "Utilization data not available for forecasting"
+                }
+                
+            utilization_data = historical_metrics["utilization"]
+            
+            if len(utilization_data) < forecast_window:
+                return {
+                    "status": "error",
+                    "error": f"Insufficient data for forecasting. Need at least {forecast_window} months of history."
+                }
+            
+            # Calculate trend using linear regression
+            x = np.array(range(len(dates))).reshape(-1, 1)
+            y = np.array(utilization_data)
+            model = stats.linregress(x.flatten(), y)
+            
+            # Extract model parameters
+            slope = model.slope
+            intercept = model.intercept
+            r_value = model.rvalue
+            p_value = model.pvalue
+            std_error = model.stderr
+            
+            # Calculate forecast
+            next_month_index = len(dates)
+            forecast_value = slope * next_month_index + intercept
+            
+            # Calculate confidence metrics
+            r_squared = r_value ** 2
+            
+            # Calculate prediction interval (95% confidence)
+            confidence_interval = 1.96 * std_error
+            
+            # Determine forecast reliability
+            reliability = "high" if r_squared > 0.7 else "medium" if r_squared > 0.5 else "low"
+            
+            # Format forecast date range
+            next_month_start = (end_date.replace(day=1) + timedelta(days=32)).replace(day=1)
+            next_month_end = (next_month_start + timedelta(days=32)).replace(day=1) - timedelta(days=1)
+            
+            return {
+                "status": "success",
+                "resource_id": resource_id,
+                "forecast_period": {
+                    "start": next_month_start.strftime("%Y-%m-%d"),
+                    "end": next_month_end.strftime("%Y-%m-%d")
+                },
+                "forecast": {
+                    "value": round(forecast_value, 2),
+                    "confidence_interval": round(confidence_interval, 2),
+                    "lower_bound": round(max(0, forecast_value - confidence_interval), 2),
+                    "upper_bound": round(min(100, forecast_value + confidence_interval), 2)
+                },
+                "reliability": {
+                    "level": reliability,
+                    "r_squared": round(r_squared, 3),
+                    "std_error": round(std_error, 3)
+                },
+                "trend": {
+                    "slope": round(slope, 3),
+                    "direction": "increasing" if slope > 0 else "decreasing",
+                    "significance": "significant" if abs(slope) > self.deviation_thresholds["trend"] and p_value < 0.05 else "not significant"
+                },
+                "historical_data_points": len(utilization_data)
+            }
+        except Exception as e:
+            logger.error(f"Error forecasting performance for resource {resource_id}: {str(e)}")
+            return {
+                "status": "error",
+                "error": f"Error forecasting performance: {str(e)}"
+            }

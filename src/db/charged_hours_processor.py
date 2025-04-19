@@ -24,28 +24,50 @@ class ChargedHoursIngestion(BaseDataProcessor):
 
     # Define source columns expected in the Excel file
     EXPECTED_COLUMNS = [
-        'Employee Identifier', # Changed from 'Employee ID'
-        'Date Worked',         # Changed from 'Date'
-        'Hours Charged',       # Changed from 'Charged Hours'
+        'Employee Identifier',
+        'Project Identifier',
+        'Date Worked',
+        'Charged Hours',
         'Project Code',
         'Task Description'
     ]
     # Define columns critical for validation
     CRITICAL_SOURCE_COLUMNS = [
         'Employee Identifier',
+        'Project Identifier',
         'Date Worked',
-        'Hours Charged'
+        'Charged Hours'
     ]
     # Map source columns to database columns
     COLUMN_MAPPING = {
         'Employee Identifier': 'employee_id',
-        'Date Worked': 'date',
-        'Hours Charged': 'charged_hours',
+        'Project Identifier': 'project_id',
+        'Date Worked': 'charge_date',
+        'Charged Hours': 'charged_hours',
         'Project Code': 'project_code',
         'Task Description': 'task_description'
     }
     # Define the target database table
     TARGET_TABLE = 'charged_hours'
+
+    def __init__(self, source_file_path: str, db_path: str):
+        """Initialize the processor with source and database paths."""
+        super().__init__(source_file_path, db_path)
+        self.actual_columns = {}  # Will store the actual columns found in the source file
+
+    def read_source(self) -> pd.DataFrame | None:
+        """Reads the source file and validates required columns."""
+        df = super().read_source()
+        if df is not None:
+            # Store actual columns found in the source
+            self.actual_columns = {col: col for col in df.columns if col in self.EXPECTED_COLUMNS}
+            
+            # Validate critical columns (raise error if missing)
+            missing_critical = [col for col in self.CRITICAL_SOURCE_COLUMNS if col not in df.columns]
+            if missing_critical:
+                raise ValueError(f"Source file is missing required columns: {missing_critical}")
+                
+        return df
 
     def transform_data(self, df: pd.DataFrame) -> pd.DataFrame:
         """Transforms the raw DataFrame: parses dates, converts types, renames columns."""
@@ -83,8 +105,8 @@ class ChargedHoursIngestion(BaseDataProcessor):
             self.logger.error(f"Error processing date column '{date_col}': {e}", exc_info=True)
             return None
 
-        # 2. Handle Numeric Types ('Hours Charged')
-        numeric_col = 'Hours Charged' # Use the correct source column name
+        # 2. Handle Numeric Types ('Charged Hours')
+        numeric_col = 'Charged Hours'  # Changed from 'Hours Charged'
         if numeric_col in df.columns:
             try:
                 df[numeric_col] = pd.to_numeric(df[numeric_col], errors='coerce')
@@ -105,10 +127,12 @@ class ChargedHoursIngestion(BaseDataProcessor):
             self.logger.warning(f"Numeric column '{numeric_col}' not found, skipping conversion.")
 
         # 3. Handle String Types (and fill NaNs)
-        string_cols = ['Employee Identifier', 'Project Code', 'Task Description']
+        string_cols = ['Employee Identifier', 'Project Identifier', 'Project Code', 'Task Description']
         for col in string_cols:
             if col in df.columns:
                 df[col] = df[col].astype(str).fillna('') # Ensure string type, fill missing
+                # Strip whitespace
+                df[col] = df[col].str.strip()
             else:
                  self.logger.warning(f"Expected string column '{col}' not found.")
 

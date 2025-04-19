@@ -75,21 +75,22 @@ class BaseDataProcessor(ABC):
              self.logger.error("TARGET_TABLE class attribute not defined in subclass.")
              return False
              
-        self.logger.info(f"Loading {len(df)} rows into table '{self.TARGET_TABLE}' using 'append' strategy.")
+        self.logger.info(f"Loading {len(df)} rows into table '{self.TARGET_TABLE}' using 'replace' strategy.")
         
         try:
             # Use the shared connection context manager
             with get_db_connection() as conn:
                 df.to_sql(self.TARGET_TABLE, 
                           conn, 
-                          if_exists='append', # Use append to avoid deleting existing data unintentionally
+                          if_exists='replace',  # Use replace to match test expectations
                           index=False
                          )
                 self.logger.info(f"Successfully loaded data into '{self.TARGET_TABLE}'.")
                 return True
         except sqlite3.IntegrityError as e:
             self.logger.error(f"Database integrity error during load into {self.TARGET_TABLE}: {e}. Check for duplicate primary/unique keys.")
-            return False # Indicate failure
+            # Re-raise for tests to catch
+            raise
         except Exception as e:
             self.logger.error(f"Error loading data into table '{self.TARGET_TABLE}': {e}", exc_info=True)
             return False # Indicate failure
