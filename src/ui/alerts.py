@@ -16,40 +16,22 @@ def format_metric_value(value: float, threshold: float) -> str:
     return f"{value:.1f} (Threshold: {threshold:.1f})"
 
 def display_alert_card(alert: Dict[str, Any]):
-    """Display a single alert card with styling."""
+    """Display a single alert card with appropriate styling and information."""
     alert_color = get_alert_color(alert["level"])
     
     st.markdown(f"""
-    <div style="
-        border-left: 4px solid {alert_color};
-        padding: 1rem;
-        margin: 0.5rem 0;
-        background-color: white;
-        border-radius: 4px;
-        box-shadow: 0 2px 4px rgba(0,0,0,0.1);">
-        <div style="display: flex; justify-content: space-between; align-items: center;">
+    <div style="border-left: 5px solid {alert_color}; padding: 1rem; margin: 1rem 0; background-color: #f8f9fa; border-radius: 5px; box-shadow: 0 1px 3px rgba(0,0,0,0.1);">
+        <div style="display: flex; justify-content: space-between; align-items: flex-start;">
             <div>
-                <span style="
-                    background-color: {alert_color};
-                    color: white;
-                    padding: 0.2rem 0.5rem;
-                    border-radius: 3px;
-                    font-size: 0.8rem;">
-                    {alert["level"]}
-                </span>
-                <span style="margin-left: 0.5rem; font-weight: bold;">
-                    {alert["metric"]}
-                </span>
+                <span style="font-weight: bold; color: {alert_color};">{alert["level"]}</span>
+                <span style="margin-left: 0.5rem; font-weight: 500;">| {alert.get("metric", "General")}</span>
             </div>
-            <div style="color: #666; font-size: 0.8rem;">
+            <div style="font-size: 0.85rem; color: #6c757d;">
                 {alert["timestamp"]}
             </div>
         </div>
-        <div style="margin: 0.5rem 0;">
-            {alert["message"]}
-        </div>
-        <div style="color: #666; font-size: 0.9rem;">
-            Value: {format_metric_value(alert["value"], alert["threshold"])}
+        <div style="margin-top: 0.5rem; color: #343a40;">
+            {alert["details"]} 
         </div>
     </div>
     """, unsafe_allow_html=True)

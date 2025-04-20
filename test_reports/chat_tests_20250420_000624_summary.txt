@@ -1,0 +1,36 @@
+Chat Functionality Test Summary
+=============================
+
+Run at: 2025-04-20 00:06:33
+Duration: 9.13 seconds
+
+Total Tests: 32
+Passed: 7
+Failed: 4
+Errors: 0
+Skipped: 0
+
+Test Files:
+-----------
+
+test_chat_functionality.py:
+  Duration: 5.74 seconds
+  Total: 1
+  Passed: 0
+  Failed: 0
+  Errors: 0
+  Skipped: 0
+
+test_chat_e2e.py:
+  Duration: 3.39 seconds
+  Total: 31
+  Passed: 7
+  Failed: 4
+  Errors: 0
+  Skipped: 0
+
+  Failed Tests:
+    - test_chat_e2e.py::test_chat_conversation[complex_query]: FAILED
+    - test_chat_e2e.py::test_chat_conversation[follow_up_questions]: FAILED
+    - test_chat_e2e.py::test_chat_conversation[resource_underutilization]: FAILED
+    - test_chat_e2e.py::test_chat_conversation[critical_alert_scenario]: FAILED

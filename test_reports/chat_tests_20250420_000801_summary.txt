@@ -1,0 +1,30 @@
+Chat Functionality Test Summary
+=============================
+
+Run at: 2025-04-20 00:08:10
+Duration: 9.0 seconds
+
+Total Tests: 8
+Passed: 0
+Failed: 0
+Errors: 0
+Skipped: 0
+
+Test Files:
+-----------
+
+test_chat_functionality.py:
+  Duration: 5.59 seconds
+  Total: 0
+  Passed: 0
+  Failed: 0
+  Errors: 0
+  Skipped: 0
+
+test_chat_e2e.py:
+  Duration: 3.41 seconds
+  Total: 8
+  Passed: 0
+  Failed: 0
+  Errors: 0
+  Skipped: 0

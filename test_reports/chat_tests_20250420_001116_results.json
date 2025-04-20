@@ -1,0 +1,31 @@
+{
+  "timestamp": "20250420_001116",
+  "total_tests": 8,
+  "passed": 0,
+  "failed": 0,
+  "errors": 0,
+  "skipped": 0,
+  "duration": 9.22,
+  "test_files": [
+    {
+      "file": "test_chat_functionality.py",
+      "duration": 5.77,
+      "total": 0,
+      "passed": 0,
+      "failed": 0,
+      "errors": 0,
+      "skipped": 0,
+      "cases": []
+    },
+    {
+      "file": "test_chat_e2e.py",
+      "duration": 3.45,
+      "total": 8,
+      "passed": 0,
+      "failed": 0,
+      "errors": 0,
+      "skipped": 0,
+      "cases": []
+    }
+  ]
+}
